@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+
+# Real application data: the working DB (has fetched postings + scores),
+# rendered resumes/cover letters sent to real companies (PII: name, contact
+# info), and generated eval output. None of this is code -- it's personal
+# data and regenerable artifacts, neither belongs in git.
+data/jobsearch.db
+data/applications/
+data/validate_results.jsonl
+data/__pycache__/

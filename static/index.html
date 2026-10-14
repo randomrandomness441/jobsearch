@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Job Search</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<nav id="topnav">
+  <a href="/jobs/" class="active">Jobs</a>
+  <a href="/prepare/">Prepare</a>
+</nav>
+
+<div id="app">
+
+  <div id="subnav">
+    <button id="tab-postings" class="subtab active">Postings</button>
+    <button id="tab-applications" class="subtab">Applications</button>
+    <button id="tab-profile" class="subtab">Profile</button>
+    <button id="tab-gaps" class="subtab">Gaps</button>
+    <div id="subnav-spacer"></div>
+    <button id="btn-manual">+ Add job manually</button>
+    <button id="btn-refetch">Fetch new</button>
+    <button id="btn-llm-backfill" title="The only place an AI judgment happens -- never automatic. Judges target-title India/Bangalore postings that are new or stale (point bank changed since last judged).">AI-judge</button>
+    <details id="more-actions">
+      <summary>More &hellip;</summary>
+      <div class="more-menu">
+        <button id="btn-clear-llm" title="Wipes all AI scores AND immediately re-judges everything -- one click, real LLM cost">Clear &amp; re-judge all</button>
+      </div>
+    </details>
+    <span id="judge-tracker" class="dim"></span>
+  </div>
+
+  <!-- ── postings view: flat list by default, sorted by score ────────── -->
+  <div id="view-postings" class="view">
+    <div id="filters">
+      <input id="f-search" type="text" placeholder="search company or title…">
+      <label>min score <input id="f-minscore" type="number" min="0" max="100" value="0" style="width:56px" title="Only applies to AI-judged postings -- an unjudged posting has no score yet, so this filter can't touch it"></label>
+      <label><input id="f-eng" type="checkbox" checked> engineering roles only</label>
+      <select id="f-level" title="Based on your point bank: 4.5 yrs, no people-management experience recorded">
+        <option value="core" selected>SDE / Senior (your real target)</option>
+        <option value="stretch">+ Staff (stretch)</option>
+        <option value="all">All levels incl. Manager</option>
+      </select>
+      <label>fetched within <input id="f-date" type="number" min="0" value="14" style="width:48px" title="Number of days -- blank or 0 means any time fetched"> days</label>
+      <select id="f-source" title="Source: manual = added by you via the Add job manually dialog; automatic = pulled from a company's ATS feed">
+        <option value="" selected>any source</option>
+        <option value="manual">Manual only</option>
+        <option value="auto">Automatic only</option>
+      </select>
+      <select id="f-status">
+        <option value="">any status</option>
+        <option value="new">new</option>
+        <option value="queued">queued</option>
+        <option value="generated">generated</option>
+      </select>
+      <button id="btn-group-by-company" class="small">Group by company</button>
+      <span id="f-count" class="dim"></span>
+    </div>
+
+    <div id="company-scope-chip" hidden>
+      Showing: <b id="company-scope-name"></b>
+      <button id="btn-clear-company" class="small">&times; clear</button>
+    </div>
+
+    <!-- one card per company; optional, toggled on -->
+    <div id="company-cards" hidden></div>
+
+    <!-- the default view: flat list, highest score first -->
+    <div id="job-list"></div>
+    <div id="pagination">
+      <button id="p-prev">&larr; Prev</button>
+      <span id="p-info" class="dim"></span>
+      <button id="p-next">Next &rarr;</button>
+    </div>
+  </div>
+
+  <!-- ── applications view ──────────────────────────────────────────── -->
+  <div id="view-applications" class="view" hidden>
+    <div id="app-list"></div>
+  </div>
+
+  <!-- ── gaps view: distinct missing-skill clusters across scored postings ── -->
+  <div id="view-gaps" class="view" hidden>
+    <div id="gaps-topbar">
+      <button id="btn-gaps-refresh" class="primary">Refresh gaps</button>
+      <span id="gaps-count" class="dim"></span>
+    </div>
+    <p class="dim" style="margin:8px 0 16px">
+      Every real gap flagged across your scored postings, grouped by what they actually mean
+      (not by exact wording), most-common first. Fix something in your master doc, then rejudge
+      just the postings that flagged it to see if it's actually closed.
+    </p>
+    <div id="gaps-list"></div>
+  </div>
+
+  <!-- ── profile view: minimal, two steps ─────────────────────────── -->
+  <div id="view-profile" class="view" hidden>
+    <div id="pf-topbar">
+      <button id="btn-masterdoc" class="primary">View master document</button>
+      <button id="btn-manage">Manage entries</button>
+    </div>
+
+    <div id="pf-upload-box">
+      <h2>Upload a resume</h2>
+      <p class="dim">.pdf, .docx, .txt or .md &mdash; parsed text shows below for you to review before anything is saved.</p>
+      <div class="row" style="justify-content:flex-start;gap:8px">
+        <input id="pf-upload" type="file" accept=".pdf,.docx,.txt,.md">
+        <button id="pf-upload-btn" class="primary">Extract</button>
+      </div>
+      <button id="pf-paste-toggle" class="link-btn">or paste text instead &rarr;</button>
+      <div id="pf-paste-box" hidden>
+        <textarea id="pf-paste-text" rows="8" placeholder="Paste any text about your work &mdash; a bullet list, notes, an old resume draft, anything."></textarea>
+        <button id="pf-paste-btn" class="primary" style="margin-top:8px">Extract</button>
+      </div>
+      <span id="pf-upload-status" class="dim"></span>
+    </div>
+
+    <div id="pf-proposal-wrap" hidden>
+      <h2 style="font-size:14px">Parsed from your file &mdash; review, then add</h2>
+      <div id="pf-proposal"></div>
+    </div>
+  </div>
+
+  <!-- ── manage entries (fields / skills / point bank) ────────────── -->
+  <div id="manage-panel" class="panel" hidden>
+    <button class="close-x" onclick="closeManage()">✕</button>
+    <h2>Manage entries</h2>
+
+    <h3 style="font-size:13px;margin-top:16px">Profile fields</h3>
+    <div id="pf-fields"></div>
+
+    <h3 style="font-size:13px;margin-top:20px">Skills</h3>
+    <div id="pf-skills"></div>
+    <div class="row" style="justify-content:flex-start;gap:8px;margin-top:10px">
+      <input id="pf-skill-name" type="text" placeholder="skill name" style="width:160px">
+      <input id="pf-skill-cat" type="text" placeholder="category" style="width:160px">
+      <button id="pf-skill-add">+ Add skill</button>
+    </div>
+
+    <h3 style="font-size:13px;margin-top:20px">Point bank</h3>
+    <label style="display:inline-flex;align-items:center;gap:6px;margin-bottom:10px">
+      <input id="pf-show-retired" type="checkbox"> show retired
+    </label>
+    <div id="pf-points"></div>
+    <div class="row" style="justify-content:flex-start;gap:8px">
+      <button id="pf-consolidate" title="Scans every company for points describing the same real accomplishment, worded differently -- proposes a cleaned-up list to review, never merges silently">Tidy master doc</button>
+    </div>
+  </div>
+
+  <!-- ── tidy review (Tidy master doc results) ─────────────────────── -->
+  <div id="tidy-panel" class="panel" hidden>
+    <button class="close-x" onclick="closeTidy()">✕</button>
+    <h2>Proposed cleanup</h2>
+    <p class="dim" style="margin:8px 0 16px">Each box below is one company's full point list after cleanup -- edit it directly if needed, uncheck a company to skip it, then commit.</p>
+    <div id="tidy-body"></div>
+    <div class="row" style="margin-top:12px">
+      <button id="tidy-commit" class="primary">Commit checked</button>
+    </div>
+  </div>
+
+  <!-- ── master document (read-only, everything on file) ─────────────── -->
+  <div id="masterdoc-panel" class="panel" hidden>
+    <button class="close-x" onclick="closeMasterDoc()">✕</button>
+    <div id="masterdoc-body"></div>
+  </div>
+
+  <!-- ── job detail panel (slide-over) ─────────────────────────────── -->
+  <div id="overlay" hidden></div>
+  <div id="job-detail" class="panel" hidden></div>
+
+  <!-- ── manual add modal ──────────────────────────────────────────── -->
+  <div id="manual-modal" class="panel" hidden>
+    <h2>Add a job manually</h2>
+    <p class="dim">Paste the whole posting -- title on the first line, location on the second,
+      description below, exactly as copied. Title and location are pulled out automatically.
+      Dedup runs on submit; run AI-judge afterward to get a fit score.</p>
+    <label>Company <input id="m-company" type="text"></label>
+    <label>Paste job posting <textarea id="m-text" rows="14" placeholder="Software Development Engineer II&#10;Remote (India)&#10;About Us...&#10;..."></textarea></label>
+    <label>URL (optional) <input id="m-url" type="text"></label>
+    <div class="row">
+      <button id="m-cancel">Cancel</button>
+      <button id="m-submit" class="primary">Add</button>
+    </div>
+    <div id="m-result"></div>
+  </div>
+
+  <!-- ── fetch result dialog ────────────────────────────────────────── -->
+  <div id="fetch-result-modal" class="panel" hidden>
+    <button class="close-x" onclick="closeFetchResult()">✕</button>
+    <h2>Fetch complete</h2>
+    <div id="fr-body"></div>
+  </div>
+
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
