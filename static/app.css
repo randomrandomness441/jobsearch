@@ -7,12 +7,43 @@
   --warn:#b45309; --warn-bg:#fef7e8;
   --bad:#dc2626; --bad-bg:#fef2f2;
   --radius:10px; --radius-sm:7px; --radius-pill:999px;
+  --shadow-sm:0 1px 2px rgba(24,24,27,.06);
   --shadow-md:0 8px 24px rgba(24,24,27,.14);
   --sans:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
 }
+/* Dark mode, automatic (follows the OS/browser setting, no toggle to build
+   or maintain) -- same token names, so every rule below just works without
+   a second ruleset per component. Panels a shade lighter than the page
+   background (not pure black) so cards still read as raised surfaces. */
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#121214; --panel:#1b1b1e; --panel-2:#232327;
+    --border:#2e2e33; --border-strong:#3f3f46;
+    --fg:#f0f0f2; --fg-2:#b4b4ba; --dim:#7a7a82;
+    --accent:#8266ff; --accent-ink:#ffffff; --accent-hover:#9480ff;
+    --ok:#4ade80; --ok-bg:#153223;
+    --warn:#fbbf24; --warn-bg:#3a2a0e;
+    --bad:#f87171; --bad-bg:#3a1515;
+    --shadow-sm:0 1px 2px rgba(0,0,0,.3);
+    --shadow-md:0 8px 24px rgba(0,0,0,.5);
+  }
+}
 *{box-sizing:border-box}
 html,body{margin:0;height:100%}
+/* Inline-style replacements -- small, one-off width/spacing utilities that
+   used to live as style="" attributes in index.html. */
+.w-xs{width:48px}
+.w-sm{width:56px}
+.w-md{width:160px}
+.mt-sm{margin-top:8px}
+.mt-md{margin-top:12px}
+.h2-sm{font-size:14px}
+.h3-manage{font-size:13px;margin-top:16px}
+.h3-spaced{margin-top:20px}
+.help-text{margin:8px 0 16px}
+.row-start{justify-content:flex-start;gap:8px}
+.inline-check{display:inline-flex;align-items:center;gap:6px;margin-bottom:10px}
 /* Type scale bumped up across the board -- base body text was 14px, most
    secondary text (badges, meta lines, labels) was 11-12.5px, well under the
    ~16px web baseline readability research converges on (readability keeps
@@ -221,3 +252,38 @@ label{display:block;font-size:14px;color:var(--fg-2);margin:10px 0 4px;font-weig
   border:1px solid var(--border);border-radius:var(--radius-sm);box-shadow:var(--shadow-md);
   padding:6px;display:flex;flex-direction:column;gap:4px;z-index:20;min-width:150px}
 .more-menu button{text-align:left;white-space:nowrap}
+
+/* ── visual polish pass: subtle lift on hover instead of a flat border-only
+   change, consistent transition timing everywhere a hover state exists ── */
+button,.job-row,.gap-row,.company-card,.doc-link{transition:border-color .12s ease,
+  background-color .12s ease,box-shadow .12s ease,transform .12s ease}
+.job-row,.gap-row{box-shadow:var(--shadow-sm)}
+.job-row:hover,.gap-row:hover{box-shadow:var(--shadow-md);transform:translateY(-1px)}
+.company-card{box-shadow:var(--shadow-sm)}
+.company-card:hover{box-shadow:var(--shadow-md);transform:translateY(-1px)}
+button.primary{box-shadow:0 1px 2px rgba(109,74,255,.25)}
+
+/* ── responsive: this app had zero breakpoints before this pass. Single
+   column below 700px, filters/subnav stack and wrap, panels go full-width
+   instead of a fixed right-hand slide-over that didn't fit a phone. ── */
+@media (max-width:700px){
+  #topnav{padding:8px 14px 0;overflow-x:auto}
+  #app{padding:0 14px 40px}
+  #subnav{gap:4px}
+  #subnav-spacer{flex-basis:100%;height:0}
+  #filters{gap:10px}
+  #f-search{width:100%}
+  #f-count{margin-left:0;flex-basis:100%}
+  .job-row{flex-wrap:wrap}
+  .job-badges{flex-basis:100%;margin-top:4px}
+  .panel{width:100vw;max-width:100vw;padding:20px 18px}
+  #manual-modal.panel,#fetch-result-modal.panel,#point-modal.panel{
+    top:0;left:0;right:0;bottom:0;transform:none;width:100vw;max-width:100vw;
+    max-height:100vh;border-radius:0}
+  #company-cards:not([hidden]){grid-template-columns:1fr 1fr}
+  .score-block{flex-wrap:wrap}
+  #pagination:not([hidden]){gap:10px}
+}
+@media (max-width:420px){
+  #company-cards:not([hidden]){grid-template-columns:1fr}
+}

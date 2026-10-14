@@ -157,6 +157,14 @@ def _migrate(con):
         # resume so "is this project worth adding" is answered up front,
         # not only discovered after a generate.
         con.execute("ALTER TABLE jobs ADD COLUMN llm_projects TEXT DEFAULT '[]'")
+    if "notified_ts" not in cols:
+        # When the poll loop last sent a crossed-threshold notification for
+        # this job -- NULL until sent, so a job already notified isn't sent
+        # again every 10-minute tick. Cleared back to NULL if llm_score
+        # later drops below the notify threshold, so a genuine re-crossing
+        # (master doc changed, JD edited) notifies again rather than being
+        # silently swallowed forever by the first notification.
+        con.execute("ALTER TABLE jobs ADD COLUMN notified_ts REAL")
 
     cols = {r[1] for r in con.execute("PRAGMA table_info(point_bank)").fetchall()}
     if "entry_type" not in cols:
@@ -535,6 +543,26 @@ def jobs_set_llm_score(jid, score, reason, missing=None, projects=None):
     con = connect()
     con.execute("UPDATE jobs SET llm_score=?, llm_reason=?, llm_judged_ts=?, llm_missing=?, llm_projects=? WHERE id=?",
                 (score, reason, time.time(), json.dumps(missing or []), json.dumps(projects or []), jid))
+    con.commit()
+    con.close()
+
+
+def jobs_mark_notified(jid):
+    """Called once the poll loop has actually sent a crossed-threshold
+    notification for this job -- the gate that stops every later 10-minute
+    tick from re-sending it."""
+    con = connect()
+    con.execute("UPDATE jobs SET notified_ts=? WHERE id=?", (time.time(), jid))
+    con.commit()
+    con.close()
+
+
+def jobs_clear_notified(jid):
+    """Called when a job's score drops back below the notify threshold, so
+    a later genuine re-crossing notifies again instead of being silently
+    swallowed forever by the first notification."""
+    con = connect()
+    con.execute("UPDATE jobs SET notified_ts=NULL WHERE id=?", (jid,))
     con.commit()
     con.close()
 
