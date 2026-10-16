@@ -165,6 +165,16 @@ def _migrate(con):
         # (master doc changed, JD edited) notifies again rather than being
         # silently swallowed forever by the first notification.
         con.execute("ALTER TABLE jobs ADD COLUMN notified_ts REAL")
+    if "llm_requirements" not in cols:
+        # JSON [{requirement, importance, presence, depth, evidence_row_id,
+        # weight, earned}, ...] -- Call 1's own per-requirement breakdown,
+        # previously only ever held transiently in memory during a generate
+        # and never persisted. Needed so a generate can REUSE a non-stale
+        # AI-judge score instead of silently re-running Call 1 from scratch
+        # (a second, independent, non-deterministic LLM call) -- that gap
+        # was producing two different "ATS scores" for the same posting:
+        # one on the postings list, a different one in ats_estimate.md.
+        con.execute("ALTER TABLE jobs ADD COLUMN llm_requirements TEXT DEFAULT '[]'")
 
     cols = {r[1] for r in con.execute("PRAGMA table_info(point_bank)").fetchall()}
     if "entry_type" not in cols:
@@ -554,10 +564,12 @@ def jobs_added_count(start_ts, end_ts=None):
 
 
 
-def jobs_set_llm_score(jid, score, reason, missing=None, projects=None):
+def jobs_set_llm_score(jid, score, reason, missing=None, projects=None, requirements=None):
     con = connect()
-    con.execute("UPDATE jobs SET llm_score=?, llm_reason=?, llm_judged_ts=?, llm_missing=?, llm_projects=? WHERE id=?",
-                (score, reason, time.time(), json.dumps(missing or []), json.dumps(projects or []), jid))
+    con.execute("UPDATE jobs SET llm_score=?, llm_reason=?, llm_judged_ts=?, llm_missing=?, llm_projects=?, "
+                "llm_requirements=? WHERE id=?",
+                (score, reason, time.time(), json.dumps(missing or []), json.dumps(projects or []),
+                 json.dumps(requirements or []), jid))
     con.commit()
     con.close()
 

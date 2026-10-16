@@ -1078,6 +1078,34 @@ def _zai_select_content(job, profile, point_bank_items, skill_names, candidate_y
     return {"priority_items": salvaged, "skills": skills, "role_assessment": role_assessment}
 
 
+def _cached_score_for_job(job):
+    """The job's already-judged Call 1 result, in the exact shape
+    _zai_score_requirements returns, or None if it's never been judged or
+    was judged before the master doc (point bank/skills/profile) last
+    changed -- same rule jobs_llm_score_stale already enforces for the
+    AI-judge button, reused here so generate() can skip a redundant,
+    independent re-score instead of silently producing a second, possibly
+    different, number for the same posting."""
+    if jobsdb.jobs_llm_score_stale(job):
+        return None
+    requirements = json.loads(job["llm_requirements"] or "[]")
+    if not requirements:
+        # A job scored before llm_requirements existed (or scored by a code
+        # path that predates this reuse) has a real, non-stale score but no
+        # requirement grounding to hand Call 2 -- not safe to reuse as-is.
+        # Falling through to a real re-score here is a one-time cost per
+        # such job; once it has, this field is populated and every later
+        # generate reuses it normally.
+        return None
+    return {
+        "score": job["llm_score"],
+        "reason": job["llm_reason"],
+        "requirements": requirements,
+        "missing": json.loads(job["llm_missing"] or "[]"),
+        "project_assessment": json.loads(job["llm_projects"] or "[]"),
+    }
+
+
 def _zai_generate_and_score(job, profile, point_bank_items, skill_names, candidate_years, forced_project_ids=None,
                              tuning_key="generate_batch"):
     """Thin orchestrator over the two-call split above: _zai_score_requirements
@@ -1098,10 +1126,22 @@ def _zai_generate_and_score(job, profile, point_bank_items, skill_names, candida
 
     Returns a dict ready to hand straight to jobsearch's generate.generate()
     as `selection`, or None if either call/parse/style-gate failed (caller
-    treats that as "not generated yet", never as a 0 or an empty resume)."""
-    scored = _zai_score_requirements(job, profile, point_bank_items, candidate_years, tuning_key=tuning_key)
+    treats that as "not generated yet", never as a 0 or an empty resume).
+
+    Reuses the job's already-judged Call 1 result (score/reason/requirements/
+    missing/project_assessment) when it isn't stale, instead of always
+    re-running Call 1 here -- found live: re-running it unconditionally meant
+    generate() and the AI-judge batch each independently called the same
+    non-deterministic scoring prompt, so the postings list and a resume's own
+    ats_estimate.md could show two different scores for the identical job,
+    with no real change in between. Same staleness rule the AI-judge button
+    itself already uses (jobs_llm_score_stale), so a master-doc edit still
+    forces a genuine re-score here, same as it always has."""
+    scored = _cached_score_for_job(job)
     if scored is None:
-        return None
+        scored = _zai_score_requirements(job, profile, point_bank_items, candidate_years, tuning_key=tuning_key)
+        if scored is None:
+            return None
     # A project Call 1 already judged genuinely worth_including for this JD now actually
     # lands on the resume instead of sitting advisory-only until the user manually clicks
     # "Add to resume" -- found live: a real generate for a distributed-systems posting
@@ -1445,7 +1485,8 @@ def _score_only(job, profile, point_bank_items, candidate_years, tuning_key="jud
     if result is None:
         return False, "LLM call failed or returned unusable content -- see server logs"
     jobsdb.jobs_set_llm_score(job["id"], result["score"], result["reason"],
-                               missing=result["missing"], projects=result["project_assessment"])
+                               missing=result["missing"], projects=result["project_assessment"],
+                               requirements=result["requirements"])
     return True, None
 
 
@@ -1621,7 +1662,8 @@ def _generate_single_job(jid):
     if not ok:
         return False, err
     jobsdb.jobs_set_llm_score(jid, selection["score"], selection["reason"],
-                               missing=selection["missing"], projects=selection["project_assessment"])
+                               missing=selection["missing"], projects=selection["project_assessment"],
+                               requirements=selection["requirements"])
     return True, None
 
 
@@ -1668,7 +1710,8 @@ def _run_generate_batch(candidates, profile, point_bank_items, skill_names, cand
                         _generate_progress["generated"] += 1
                         jobsdb.jobs_set_llm_score(fresh["id"], selection["score"], selection["reason"],
                                                    missing=selection["missing"],
-                                                   projects=selection["project_assessment"])
+                                                   projects=selection["project_assessment"],
+                                                   requirements=selection["requirements"])
                     else:
                         _generate_progress["failed"].append(
                             {"job_id": fresh["id"], "title": fresh["title"],
@@ -2204,7 +2247,8 @@ class Handler(BaseHTTPRequestHandler):
             if not ok:
                 return self._json({"error": err}, 500)
             jobsdb.jobs_set_llm_score(jid, selection["score"], selection["reason"],
-                                       missing=selection["missing"], projects=selection["project_assessment"])
+                                       missing=selection["missing"], projects=selection["project_assessment"],
+                                       requirements=selection["requirements"])
             return self._json({"ok": True})
 
         if p == "/api/jobs/clear-llm-scores":
