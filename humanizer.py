@@ -45,13 +45,16 @@ _NOT_JUST_RE = re.compile(r"\bnot\s+just\b.{0,60}?\b(it'?s|it\s+is|but)\b", re.I
 # re-reads; a sentence that needs a second pass has already failed.
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 LONG_SENTENCE_WORD_LIMIT = 35     # plain-language guidance: ~20-25 is easy, 30+ is hard
-MAX_COMMAS_PER_SENTENCE = 4        # HUMAN_STYLE_RULES already says "one idea per sentence" --
-                                    # was 3, loosened after a real failure: "detector (~98% accurate)
-                                    # using embeddings, a vector database and semantic search over
-                                    # metric definitions, so the platform reuses..." is a legitimate
-                                    # tech-enumeration-plus-outcome shape (3 items + one "so" clause
-                                    # naturally needs 4 commas), not a run-on; 3 was catching reasonable
-                                    # sentences, not just genuinely stuffed ones.
+MAX_COMMAS_PER_SENTENCE = 6        # HUMAN_STYLE_RULES already says "one idea per sentence" --
+                                    # was 3, then 4, loosened again after a second real failure: a
+                                    # cover-letter draft listing 4 technologies ("...hands-on experience
+                                    # with Kafka, Spark, Iceberg, and schema registries...") plus one more
+                                    # clause hit 6 commas and failed the humanizer gate 3x in a row with
+                                    # NO fallback (unlike bullet selection, the draft call has nothing to
+                                    # revert to), killing the whole generation outright. A short list of
+                                    # named technologies reads fine regardless of raw comma count -- it's
+                                    # one enumeration, not several stacked clauses -- this cap now
+                                    # tolerates that shape while still catching genuinely tangled prose.
                                    # -- this is the code-level version of that rule
 
 

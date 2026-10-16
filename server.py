@@ -1306,7 +1306,12 @@ def _zai_draft_application(job, profile, points_text, skill_names, candidate_yea
         f"Job posting -- {job['title']} at {job['company']}:\n{_trim_jd(job['description_raw'])}"
     )
     messages = [{"role": "user", "content": user}]
-    for attempt in range(3):
+    # 4, was 3 -- this call has no salvage fallback (unlike bullet selection, which can
+    # revert to the real point-bank text when a reword keeps failing). A style-gate loss
+    # here kills the whole generation outright, so it gets one extra attempt with the
+    # explicit violations fed back before giving up.
+    draft_attempts = 4
+    for attempt in range(draft_attempts):
         reply, provider = _llm_json_call(system, messages, max_tokens=32000, temperature=0.4,
                                           **_llm_tuning(tuning_key))
         if reply is None:
@@ -1331,12 +1336,12 @@ def _zai_draft_application(job, profile, points_text, skill_names, candidate_yea
             violations.append("cover_letter_body is empty or too short -- write the real 3-4 paragraph cover letter, not nothing")
         if not violations:
             return summary, cover, None
-        if attempt < 2:
+        if attempt < draft_attempts - 1:
             messages.append({"role": "assistant", "content": reply})
             messages.append({"role": "user", "content": (
                 "That draft fails the style check -- fix these and reply with the same "
                 "JSON shape, nothing else:\n- " + "\n- ".join(violations))})
-    reason = "failed the humanizer gate 3x in a row: " + "; ".join(violations)
+    reason = f"failed the humanizer gate {draft_attempts}x in a row: " + "; ".join(violations)
     print(f"[jobs] {provider} draft for job {job['id']} {reason}", file=sys.stderr)
     return None, None, reason
 
