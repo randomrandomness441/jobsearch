@@ -1696,6 +1696,8 @@ def _run_generate_batch(candidates, profile, point_bank_items, skill_names, cand
                     selection = _zai_generate_and_score(
                         fresh, profile, point_bank_items, skill_names, candidate_years)
                     if selection is None:
+                        print(f"[jobs] generate-queued: selection call failed for job {fresh['id']}",
+                              file=sys.stderr)
                         _generate_progress["failed"].append(
                             {"job_id": fresh["id"], "title": fresh["title"], "company": fresh["company"],
                              "reason": "content selection/scoring call failed -- see server logs"})
@@ -1705,6 +1707,8 @@ def _run_generate_batch(candidates, profile, point_bank_items, skill_names, cand
                     summary, cover, draft_err = _zai_draft_application(
                         fresh, profile, points_text, skill_names, candidate_years)
                     if summary is None:
+                        print(f"[jobs] generate-queued: draft failed for job {fresh['id']}: {draft_err}",
+                              file=sys.stderr)
                         _generate_progress["failed"].append(
                             {"job_id": fresh["id"], "title": fresh["title"],
                              "company": fresh["company"], "reason": draft_err})
@@ -1718,6 +1722,8 @@ def _run_generate_batch(candidates, profile, point_bank_items, skill_names, cand
                                                    projects=selection["project_assessment"],
                                                    requirements=selection["requirements"])
                     else:
+                        print(f"[jobs] generate-queued: render failed for job {fresh['id']}: {err}",
+                              file=sys.stderr)
                         _generate_progress["failed"].append(
                             {"job_id": fresh["id"], "title": fresh["title"],
                              "company": fresh["company"], "reason": err})

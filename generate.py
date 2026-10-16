@@ -377,8 +377,13 @@ def _render_and_count(profile, resume_title, summary, roles, skills_by_category,
     docx_path = os.path.join(folder, "resume.docx")
     pdf_path = os.path.join(folder, "resume.pdf")
     resume_render.render(profile, resume_title, summary, roles, skills_by_category, docx_path, projects=projects)
+    # 120s, was 60 -- too tight on a slower/resource-constrained VPS, especially since the
+    # one-page trim loop can call this several times in one generate; found live: a real
+    # VPS generate completed the resume fine but silently died here before ever reaching
+    # the cover letter, raising subprocess.TimeoutExpired that generate_cli.py's own
+    # except-and-return swallowed into a plain {"error": ...} reply.
     subprocess.run(["soffice", "--headless", "--convert-to", "pdf", "--outdir", folder, docx_path],
-                    capture_output=True, timeout=60)
+                    capture_output=True, timeout=120)
     return docx_path, pdf_path, _page_count(pdf_path)
 
 
@@ -585,8 +590,9 @@ def generate(job_id, summary, cover_letter_body, selection, out_root="data/appli
 
     cover_docx = os.path.join(folder, "cover_letter.docx")
     resume_render.render_cover_letter_docx(profile, job["company"], job["title"], cover_letter_body, cover_docx)
+    # 120s, was 60 -- see the matching comment on the resume's own soffice call above.
     subprocess.run(["soffice", "--headless", "--convert-to", "pdf", "--outdir", folder, cover_docx],
-                    capture_output=True, timeout=60)
+                    capture_output=True, timeout=120)
     cover_pdf = os.path.join(folder, "cover_letter.pdf")
 
     with open(os.path.join(folder, "job_description.md"), "w") as f:
