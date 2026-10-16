@@ -1576,8 +1576,14 @@ def _generate_one(job_id, summary, cover_letter_body, selection):
         req_path = f.name
     try:
         out = subprocess.run(
+            # Was 60s -- too tight on a slower VPS box. The one-page trim loop can call
+            # soffice (docx->pdf) several times in one generate, and a cold/resource-
+            # constrained LibreOffice invocation is slower than on a dev machine. Found
+            # live: a real VPS generate got killed mid-render, leaving resume.pdf on disk
+            # but no cover letter, ats_estimate.md, or validation_checklist.md -- the
+            # subprocess was killed by this timeout before generate.generate() finished.
             [VENV_PY, os.path.join(ROOT, "generate_cli.py"), req_path],
-            capture_output=True, text=True, timeout=60, cwd=ROOT,
+            capture_output=True, text=True, timeout=240, cwd=ROOT,
         )
     finally:
         os.unlink(req_path)
@@ -2234,8 +2240,10 @@ class Handler(BaseHTTPRequestHandler):
                 req_path = f.name
             try:
                 out = subprocess.run(
+                    # Was 30s -- same VPS timeout fix as _generate_one's call below, see
+                    # that comment for why.
                     [VENV_PY, os.path.join(ROOT, "generate_cli.py"), req_path],
-                    capture_output=True, text=True, timeout=30, cwd=ROOT,
+                    capture_output=True, text=True, timeout=240, cwd=ROOT,
                 )
             finally:
                 os.unlink(req_path)
