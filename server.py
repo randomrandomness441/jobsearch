@@ -39,6 +39,10 @@ STATIC = os.path.join(ROOT, "static")
 APPLICATIONS = os.path.join(ROOT, "data", "applications")
 VENV_PY = os.path.join(ROOT, ".venv", "bin", "python3")
 PORT = int(os.environ.get("PORT", "8777"))
+# 127.0.0.1 by default (local dev only, matches old behavior) -- a VPS deploy needs
+# HOST=0.0.0.0 in its .env, or the server only ever accepts connections from inside
+# the VPS itself, which looks exactly like "connection refused" from outside.
+HOST = os.environ.get("HOST", "127.0.0.1")
 
 # Shared by every truthful-writing prompt below -- what actually makes text
 # read as AI-generated (em dashes, "not X but Y", hedging) rather than a
@@ -2448,9 +2452,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    srv = ThreadingHTTPServer((HOST, PORT), Handler)
     srv.daemon_threads = True
-    print(f"jobsearch  ->  http://localhost:{PORT}")
+    print(f"jobsearch  ->  http://{HOST}:{PORT}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
