@@ -121,10 +121,11 @@ def render(profile, title, summary, roles, skills_by_category, out_path, project
     title_p = doc.add_paragraph(title)
     _tighten(title_p, space_after=2)
 
+    contact_parts = [profile['phone'], profile['email'], profile['linkedin'], profile['github']]
+    if profile.get('portfolio'):   # .get -- older profiles saved before this field existed still render fine
+        contact_parts.append(profile['portfolio'])
     contact = doc.add_paragraph()
-    contact.add_run(
-        f"{profile['phone']} | {profile['email']} | {profile['linkedin']} | {profile['github']}"
-    )
+    contact.add_run(" | ".join(contact_parts))
     _tighten(contact, space_after=2)
 
     _heading(doc, "SUMMARY")

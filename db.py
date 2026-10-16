@@ -310,6 +310,21 @@ def point_bank_update_text(pid, text):
     _touch_profile_version()
 
 
+def point_bank_update_entry_type(pid, entry_type, role=None):
+    """Reclassify a row between 'role' and 'project'. `role` optionally
+    overwrites the role/tagline column in the same call -- needed when a
+    row was filed as a fake 'role' (e.g. titled "Builder") for something
+    that's really one project's tagline line, not a job title."""
+    con = connect()
+    if role is None:
+        con.execute("UPDATE point_bank SET entry_type=? WHERE id=?", (entry_type, pid))
+    else:
+        con.execute("UPDATE point_bank SET entry_type=?, role=? WHERE id=?", (entry_type, role, pid))
+    con.commit()
+    con.close()
+    _touch_profile_version()
+
+
 # ── skills ──────────────────────────────────────────────────────────────
 def skills_add(name, category):
     # Case-insensitive lookup -- the UNIQUE constraint on name is case-
@@ -467,8 +482,8 @@ def jobs_query(status=None, eng_only=True, level_tiers=None, min_score=None, q_t
     this whole app only ever targets that location now.
 
     Returns (total_unfiltered, matched_jobs) -- matched_jobs already sorted
-    by LLM score descending, NULLS LAST (unjudged postings sort after judged
-    ones, by fetch date)."""
+    by fetch date descending (newest first), score as the tiebreaker among
+    postings fetched at the same time."""
     con = connect()
 
     unfiltered_q, unfiltered_params = "SELECT COUNT(*) FROM jobs", []
@@ -511,7 +526,7 @@ def jobs_query(status=None, eng_only=True, level_tiers=None, min_score=None, q_t
         where.append("id NOT IN (SELECT DISTINCT job_id FROM applications WHERE status != 'generated')")
 
     query = ("SELECT * FROM jobs WHERE " + " AND ".join(where) +
-              " ORDER BY llm_score DESC NULLS LAST, fetched_ts DESC")
+              " ORDER BY fetched_ts DESC, llm_score DESC NULLS LAST")
     rows = con.execute(query, params).fetchall()
     con.close()
     return total_unfiltered, [dict(r) for r in rows]

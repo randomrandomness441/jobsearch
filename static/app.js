@@ -36,14 +36,34 @@ function _missingHtml(missing) {
 // project actually lands on the page (wired separately, see openJob()).
 function _projectsHtml(projects) {
   if (!projects || !projects.length) return '';
+  // One card per PROJECT, not per point-bank row -- a project with
+  // several facts on file (e.g. 3 rows under "Kapitsa") used to render as
+  // 3 separate "projects" with the same name, each with its own button.
+  // Grouped by name here instead; the button carries every row id
+  // belonging to that project, so "Add to resume" forces the whole
+  // project in, not just whichever fact happened to list first.
+  const byName = new Map();
+  for (const p of projects) {
+    if (!byName.has(p.name)) byName.set(p.name, []);
+    byName.get(p.name).push(p);
+  }
+  const cards = [...byName.entries()].map(([name, rows]) => {
+    const anyWorthIt = rows.some(p => p.worth_including);
+    const rowIds = rows.map(p => p.row_id).join(',');
+    const reasonLines = rows.map(p =>
+      `<div>${p.worth_including ? '✓' : '–'} ${esc(p.reason || '')}</div>`).join('');
+    return `
+      <div class="dim" style="font-size:12px;margin-top:6px;display:flex;align-items:flex-start;gap:8px">
+        <span style="flex:1">
+          <b style="color:${anyWorthIt ? 'var(--ok)' : 'var(--dim)'}">${esc(name)}</b>
+          ${reasonLines}
+        </span>
+        <button class="small jd-add-project" data-row-ids="${rowIds}">Add to resume</button>
+      </div>`;
+  }).join('');
   return `<div style="margin-top:8px">
     <div class="dim" style="font-size:12px;font-weight:600">Projects (not on the resume unless you add one)</div>
-    ${projects.map(p => `
-      <div class="dim" style="font-size:12px;margin-top:4px;display:flex;align-items:center;gap:8px">
-        <span style="flex:1"><b style="color:${p.worth_including ? 'var(--ok)' : 'var(--dim)'}">${esc(p.name)}</b>
-        -- ${p.worth_including ? 'worth adding' : 'probably skip'}: ${esc(p.reason || '')}</span>
-        <button class="small jd-add-project" data-row-id="${p.row_id}">Add to resume</button>
-      </div>`).join('')}
+    ${cards}
   </div>`;
 }
 
@@ -270,9 +290,9 @@ async function openJob(id) {
   // otherwise, this is the only thing that actually puts it on the page.
   panel.querySelectorAll('.jd-add-project').forEach(btn => {
     btn.onclick = async () => {
-      const rowId = btn.dataset.rowId;
+      const rowIds = btn.dataset.rowIds.split(',').map(Number);
       btn.disabled = true; btn.textContent = 'Adding…';
-      const res = await post('/api/jobs/generate-with-project', {job_id: j.id, project_id: rowId});
+      const res = await post('/api/jobs/generate-with-project', {job_id: j.id, project_ids: rowIds});
       if (res.error) { flashCount(res.error); btn.disabled = false; btn.textContent = 'Add to resume'; return; }
       flashCount('Project added -- resume regenerated.');
       openJob(id); loadJobs();
@@ -719,34 +739,41 @@ async function pollJudgeStatus(btn, defaultLabel) {
 document.getElementById('btn-llm-backfill').onclick = async () => {
   const btn = document.getElementById('btn-llm-backfill');
   btn.disabled = true; btn.textContent = 'Starting…';
-  const res = await post('/api/jobs/llm-backfill', {});
+  // Its own date box (f-judge-days), separate from the list's display
+  // filter (f-date) -- the two used to share one input, which meant
+  // narrowing the list to browse also silently narrowed what AI-judge would
+  // score. Never changes the server's own "not yet judged, or stale"
+  // default -- the date cutoff is an extra AND on top of that, not a
+  // replacement for it.
+  const days = document.getElementById('f-judge-days').value;
+  const res = await post('/api/jobs/llm-backfill', {days});
   if (res.error) { flashCount(res.error); btn.disabled = false; btn.textContent = 'AI-judge'; return; }
   if (!res.candidates) { flashCount('Nothing new or stale to judge.'); btn.disabled = false; btn.textContent = 'AI-judge'; return; }
   pollJudgeStatus(btn, 'AI-judge');
 };
-// One click, not two: clearing scores alone was never useful on its own --
-// the only reason to wipe them is so the next AI-judge pass re-checks
-// everything, so do that pass right here instead of making it a separate
-// button press. Costs a real LLM call per eligible posting -- the confirm
-// text says so.
+// Clear only -- it used to also force an immediate re-judge pass in the
+// same click (and called itself "...all", even though it was already
+// scoped to a date filter, which was the actually-confusing part). Simpler
+// now: this button only wipes scores, in its own date window (f-clear-days,
+// independent of the list filter and of AI-judge's own day count). A
+// cleared posting has no score, which already satisfies AI-judge's normal
+// "not yet judged" default -- so re-judging it is just clicking AI-judge
+// next, same as for any other unjudged posting, not a special combined flow.
 document.getElementById('btn-clear-llm').onclick = async () => {
   document.getElementById('more-actions').open = false;
-  // Scoped to whatever the date filter up top is currently set to -- clearing
-  // everything back to day one meant the next judge pass re-spent real LLM
-  // calls on postings from months back that are probably closed by now.
-  const days = document.getElementById('f-date').value;
+  const days = document.getElementById('f-clear-days').value;
   const scopeLabel = days ? `the last ${days} day(s)` : 'ALL TIME';
-  if (!confirm(`Clear AI scores and re-judge, scoped to postings fetched in ${scopeLabel}? `
-    + '(change the date filter above first to widen or narrow this) Real LLM cost per posting.')) return;
+  if (!confirm(`Clear AI scores for postings fetched in ${scopeLabel}? `
+    + '(change the day count above first to widen or narrow this) '
+    + "You'll need to click AI-judge afterward to re-score them -- real LLM cost per posting.")) return;
   const btn = document.getElementById('btn-clear-llm');
   btn.disabled = true;
   btn.textContent = 'Clearing…';
   const cleared = await post('/api/jobs/clear-llm-scores', {days});
-  const res = await post('/api/jobs/llm-backfill', {days});
-  if (res.error) { flashCount(res.error); btn.disabled = false; btn.textContent = 'Clear & re-judge all'; return; }
-  flashCount(`Cleared ${cleared.cleared}. ${res.candidates ? 'Judging ' + res.candidates + '…' : 'Nothing to judge.'}`);
-  if (!res.candidates) { btn.disabled = false; btn.textContent = 'Clear & re-judge all'; reloadCurrentView(); return; }
-  pollJudgeStatus(btn, 'Clear & re-judge all');
+  btn.disabled = false;
+  btn.textContent = 'Clear scores';
+  flashCount(`Cleared ${cleared.cleared}.`);
+  reloadCurrentView();
 };
 function resetAndLoad() {
   currentPage = 1;
@@ -775,8 +802,8 @@ document.getElementById('p-next').onclick = () => { currentPage++; loadJobs(); }
 // ── profile view ─────────────────────────────────────────────────────
 const FIELD_LABELS = {
   name: 'Name', title: 'Title', phone: 'Phone', email: 'Email', linkedin: 'LinkedIn',
-  github: 'GitHub', education: 'Education', years_experience: 'Years experience',
-  summary_current: 'Current summary',
+  github: 'GitHub', portfolio: 'Portfolio site', education: 'Education',
+  years_experience: 'Years experience', summary_current: 'Current summary',
 };
 
 async function loadProfile() {
@@ -1155,16 +1182,41 @@ async function openMasterDoc() {
   // retired entries when you need to.
   const activePoints = points.filter(p => p.active);
 
-  const roles = [];
-  const seen = new Map();
-  for (const p of activePoints) {
-    const key = p.company + '|' + p.role;
-    if (!seen.has(key)) {
-      seen.set(key, {company: p.company, role: p.role, start: p.start_date, end: p.end_date, points: []});
-      roles.push(seen.get(key));
+  // Grouped by COMPANY ONLY, same fix generate.py already uses for actual
+  // resume rendering -- a title change/promotion at the same company
+  // (different `role` values, same company) used to split into two
+  // top-level blocks here, each repeating the company name. Projects get
+  // the identical treatment: a project's tagline/stack line differing
+  // slightly across its point-bank rows must not split it into two blocks.
+  function groupByCompany(items) {
+    const groups = [];
+    const seen = new Map();
+    for (const p of items) {
+      if (!seen.has(p.company)) {
+        seen.set(p.company, {company: p.company, rows: []});
+        groups.push(seen.get(p.company));
+      }
+      seen.get(p.company).rows.push(p);
     }
-    seen.get(key).points.push(p);
+    for (const g of groups) {
+      g.rows.sort((a, b) => a.id - b.id);
+      const starts = g.rows.map(p => p.start_date).filter(Boolean);
+      g.start = starts.length ? starts.sort()[0] : '';
+      g.end = g.rows.some(p => !p.end_date) ? null : g.rows.map(p => p.end_date).sort().slice(-1)[0];
+      // Current title/tagline: prefer open-ended (still going) over closed;
+      // among those, latest start_date; among ties, highest id.
+      g.role = g.rows.slice().sort((a, b) => {
+        const aOpen = a.end_date ? 0 : 1, bOpen = b.end_date ? 0 : 1;
+        if (aOpen !== bOpen) return aOpen - bOpen;
+        if ((a.start_date || '') !== (b.start_date || '')) return (a.start_date || '') < (b.start_date || '') ? -1 : 1;
+        return a.id - b.id;
+      }).slice(-1)[0].role;
+    }
+    return groups;
   }
+
+  const roleGroups = groupByCompany(activePoints.filter(p => p.entry_type !== 'project'));
+  const projectGroups = groupByCompany(activePoints.filter(p => p.entry_type === 'project'));
 
   const flaggedCount = activePoints.filter(p => p.text.trim().startsWith('[')).length;
   const retiredCount = points.filter(p => !p.active).length;
@@ -1172,16 +1224,21 @@ async function openMasterDoc() {
   const byCat = {};
   for (const s of skillsData.skills) (byCat[s.category] ||= []).push(s.name);
 
-  const rolesHtml = roles.map(r => `
+  function groupHtml(g) {
+    return `
     <div class="md-role">
-      <div class="md-role-head"><span>${esc(r.role)}</span><span class="dim">${esc(r.start)} &ndash; ${esc(r.end || 'present')}</span></div>
-      <div class="md-role-company">${esc(r.company)}</div>
-      ${r.points.map(p => {
+      <div class="md-role-head"><span>${esc(g.role)}</span><span class="dim">${esc(g.start)} &ndash; ${esc(g.end || 'present')}</span></div>
+      <div class="md-role-company">${esc(g.company)}</div>
+      ${g.rows.map(p => {
         const flagged = p.text.trim().startsWith('[');
         const note = flagged ? '<span class="md-flag-note">NEEDS YOUR REVIEW</span>' : '';
         return `<div class="md-bullet ${flagged ? 'flagged' : ''}">${esc(p.text)}${note}</div>`;
       }).join('')}
-    </div>`).join('');
+    </div>`;
+  }
+
+  const rolesHtml = roleGroups.map(groupHtml).join('');
+  const projectsHtml = projectGroups.map(groupHtml).join('');
 
   const skillsHtml = Object.keys(byCat).sort().map(cat =>
     `<div class="md-skills-cat"><b>${esc(cat)}:</b> ${byCat[cat].sort().join(', ')}</div>`).join('');
@@ -1200,6 +1257,7 @@ async function openMasterDoc() {
     </p>
     <h3 style="font-size:14px;margin-top:20px">EXPERIENCE</h3>
     ${rolesHtml}
+    ${projectGroups.length ? `<h3 style="font-size:14px;margin-top:20px">PROJECTS</h3>${projectsHtml}` : ''}
     <h3 style="font-size:14px;margin-top:20px">SKILLS</h3>
     ${skillsHtml}
     <h3 style="font-size:14px;margin-top:20px">EDUCATION</h3>

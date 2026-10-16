@@ -26,10 +26,12 @@
     <button id="btn-manual">+ Add job manually</button>
     <button id="btn-refetch">Fetch new</button>
     <button id="btn-llm-backfill" title="The only place an AI judgment happens -- never automatic. Judges target-title India/Bangalore postings that are new or stale (point bank changed since last judged).">AI-judge</button>
+    <label>last <input id="f-judge-days" type="number" min="0" value="14" class="w-xs" title="How many days back AI-judge looks, independent of the list filter below. Blank or 0 means any time fetched."> days</label>
     <details id="more-actions">
       <summary>More &hellip;</summary>
       <div class="more-menu">
-        <button id="btn-clear-llm" title="Wipes all AI scores AND immediately re-judges everything -- one click, real LLM cost">Clear &amp; re-judge all</button>
+        <label>fetched within <input id="f-clear-days" type="number" min="0" value="14" class="w-xs" title="How many days back to clear, independent of the list filter and AI-judge's own day count. Blank or 0 means any time fetched."> days</label>
+        <button id="btn-clear-llm" title="Wipes AI scores for postings fetched in the window above. Does not re-judge -- click AI-judge afterward for that (it already picks up anything not yet judged).">Clear scores</button>
       </div>
     </details>
     <span id="judge-tracker" class="dim"></span>

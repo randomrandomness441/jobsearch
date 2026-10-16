@@ -13,9 +13,12 @@ the jobsearch routes/LLM calls, as its own standalone HTTP server.
 import base64
 import collections
 import concurrent.futures
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -24,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import db as jobsdb
@@ -142,7 +145,10 @@ def _filter_jobs(qs):
     This is a thin param-parsing layer over jobsdb.jobs_query -- the actual
     filtering is a SQL WHERE clause now, not a Python loop over every row
     (what this used to be). Returns (total_unfiltered, matched_jobs),
-    matched_jobs already sorted by effective score descending."""
+    matched_jobs already sorted newest-fetched first (jobs_query's own
+    order) -- the company-card best_score below is computed by an explicit
+    max-comparison loop, not by assuming row order, so this sort change
+    doesn't affect it."""
     min_score = qs.get("min_score", [None])[0]
     eng_only = qs.get("eng_only", ["1"])[0] == "1"
     q_text = (qs.get("q", [""])[0] or "").lower()
@@ -182,6 +188,129 @@ ANTHROPIC_MODEL_FALLBACK = os.environ.get("ANTHROPIC_MODEL_FALLBACK", "claude-ha
 ANTHROPIC_MODEL_FULL = os.environ.get("ANTHROPIC_MODEL_FULL", "claude-sonnet-5")
 
 ZAI_API_KEY = os.environ.get("ZAI_API_KEY", "")
+
+# Signs the one-click "Generate now" link the poll script emails out --
+# the signature itself IS the auth for that one link (clicked straight
+# from an email, not a live logged-in session), so it must never be
+# guessable. Falls back to the Zai key so a from-scratch deploy that
+# hasn't set this separately still gets a real per-install secret rather
+# than a constant every clone of this repo would share -- set
+# GENERATE_LINK_SECRET explicitly once this is actually deployed.
+GENERATE_LINK_SECRET = os.environ.get("GENERATE_LINK_SECRET", "") or ZAI_API_KEY
+
+
+def _sign_job_id(jid):
+    return hmac.new(GENERATE_LINK_SECRET.encode(), str(jid).encode(), hashlib.sha256).hexdigest()
+
+
+def _verify_job_sig(jid, sig):
+    if not GENERATE_LINK_SECRET:
+        return False
+    return hmac.compare_digest(_sign_job_id(jid), sig or "")
+
+
+# ── Google OAuth login gate ──────────────────────────────────────────────
+# Single-user: the only thing checked after Google confirms identity is
+# "does this email match ALLOWED_LOGIN_EMAIL" -- not a real multi-user
+# system, a lock on the front door for one person.
+GOOGLE_OAUTH_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
+GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
+ALLOWED_LOGIN_EMAIL = os.environ.get("ALLOWED_LOGIN_EMAIL", "")
+OAUTH_REDIRECT_URI = os.environ.get("OAUTH_REDIRECT_URI", f"http://localhost:{PORT}/auth/google/callback")
+SESSION_SECRET = os.environ.get("SESSION_SECRET", "") or GENERATE_LINK_SECRET
+SESSION_MAX_AGE = 30 * 24 * 3600  # 30 days -- one person's own tool, not a shared login
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
+
+# Reachable with no session at all: the login flow itself (can't require a
+# session to reach the page that creates one), and the generate-link/
+# view-details endpoints, which already have their own HMAC-signature auth
+# (_verify_job_sig) -- that's the whole point of them being one-click links
+# from a Telegram notification, not something that requires first being
+# logged in.
+AUTH_EXEMPT_PREFIXES = ("/auth/google/", "/api/jobs/generate-link", "/api/jobs/view-details")
+
+
+def _make_session_cookie(email):
+    expiry = int(time.time()) + SESSION_MAX_AGE
+    payload = f"{email}|{expiry}"
+    sig = hmac.new(SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}|{sig}"
+
+
+def _parse_cookies(cookie_header):
+    cookies = {}
+    for part in (cookie_header or "").split(";"):
+        if "=" in part:
+            k, v = part.strip().split("=", 1)
+            cookies[k] = v
+    return cookies
+
+
+def _valid_session_email(cookie_header):
+    """The logged-in email if the session cookie is present, correctly
+    signed, unexpired, and matches ALLOWED_LOGIN_EMAIL -- None otherwise.
+    A forged, tampered, or expired cookie is treated identically to no
+    cookie at all, never partially trusted."""
+    raw = _parse_cookies(cookie_header).get("session")
+    if not raw:
+        return None
+    try:
+        email, expiry, sig = raw.split("|", 2)
+    except ValueError:
+        return None
+    expected = hmac.new(SESSION_SECRET.encode(), f"{email}|{expiry}".encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        return None
+    if int(expiry) < time.time():
+        return None
+    if email != ALLOWED_LOGIN_EMAIL:
+        return None
+    return email
+
+
+def _google_auth_redirect_url(state):
+    params = {
+        "client_id": GOOGLE_OAUTH_CLIENT_ID, "redirect_uri": OAUTH_REDIRECT_URI,
+        "response_type": "code", "scope": "openid email profile",
+        "state": state, "prompt": "select_account",
+    }
+    return GOOGLE_AUTH_URL + "?" + urlencode(params)
+
+
+def _google_exchange_code(code):
+    """POSTs the auth code to Google's token endpoint server-to-server
+    (the one place GOOGLE_OAUTH_CLIENT_SECRET is ever used), then calls
+    the userinfo endpoint with the resulting access token. Returns the
+    logged-in email, or None on any failure -- treated as "login failed",
+    never as a free pass."""
+    data = urlencode({
+        "code": code, "client_id": GOOGLE_OAUTH_CLIENT_ID, "client_secret": GOOGLE_OAUTH_CLIENT_SECRET,
+        "redirect_uri": OAUTH_REDIRECT_URI, "grant_type": "authorization_code",
+    }).encode()
+    req = urllib.request.Request(GOOGLE_TOKEN_URL, data=data, method="POST",
+                                  headers={"content-type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            tok = json.loads(resp.read())
+    except Exception as e:
+        print(f"[auth] token exchange failed: {e}", file=sys.stderr)
+        return None
+    access_token = tok.get("access_token")
+    if not access_token:
+        print(f"[auth] token exchange returned no access_token: {tok}", file=sys.stderr)
+        return None
+    req2 = urllib.request.Request(GOOGLE_USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"})
+    try:
+        with urllib.request.urlopen(req2, timeout=15) as resp:
+            info = json.loads(resp.read())
+    except Exception as e:
+        print(f"[auth] userinfo fetch failed: {e}", file=sys.stderr)
+        return None
+    return info.get("email")
+
+
 ZAI_MODEL = os.environ.get("ZAI_MODEL", "glm-5.3-flash")
 # Full (non-Flash) GLM-5.3 -- ~13-20x the cost of Flash per Z.ai's own
 # pricing (docs.z.ai, checked live). Which call sites use which tier, and
@@ -210,6 +339,11 @@ DEFAULT_TEMPERATURE = float(os.environ.get("DEFAULT_TEMPERATURE", "0.3"))
 # each), fired concurrently: both completed cleanly, no 429s.
 _ZAI_CONCURRENCY = collections.defaultdict(lambda: threading.Semaphore(1))
 _ZAI_CONCURRENCY[ZAI_MODEL] = threading.Semaphore(2)
+# The live test above already measured glm-5.3 (full) itself at 2x concurrent
+# with zero 429s -- same result as flash -- but only flash ever got the
+# Semaphore(2) below it; glm-5.3 fell through to the conservative default of
+# 1 and was serializing every full-tier call for no measured reason.
+_ZAI_CONCURRENCY[ZAI_MODEL_FULL] = threading.Semaphore(2)
 
 # ── LLM tuning: one table, every real call site looks itself up here ────
 # Two independent knobs per call site:
@@ -377,7 +511,19 @@ def _claude_cli_call(system_prompt, messages, max_tokens=1200, temperature=None,
 
 
 def _zai_call(system_prompt, messages, max_tokens=1200, temperature=None,
-              response_format=None, model=None, reasoning_effort="low", deadline_s=65):
+              response_format=None, model=None, reasoning_effort="low", deadline_s=65,
+              thinking=True):
+    # thinking=False is a documented no-op for glm-5.3/glm-5.3-flash (the only two models
+    # this file ever calls) -- Z.ai's own API reference: "GLM-5.3 GLM-5.3-FLASH series can
+    # only be enabled, and the thinking depth is controlled by reasoning_effort" (confirmed
+    # on both the model guide pages and the chat-completion schema, 2026-10-16). A real
+    # pilot run that sent thinking=False got full, successful completions back with no
+    # error either time -- the request almost certainly ran with thinking still on and the
+    # field was silently ignored, not actually disabled; don't trust that result as a real
+    # A/B test. The only real lever for reasoning depth/latency on these models is
+    # reasoning_effort (low/high/max) -- LLM_TUNING already runs every generate/judge call
+    # site at "low", the fastest tier these models support. Kept as a real param, not
+    # removed, since a future call site on an older model (glm-4.x) could genuinely use it.
     if not ZAI_API_KEY:
         print("[jobs] ZAI_API_KEY not set -- skipping automatic reply", file=sys.stderr)
         return None
@@ -386,7 +532,7 @@ def _zai_call(system_prompt, messages, max_tokens=1200, temperature=None,
         "max_tokens": max_tokens,
         "temperature": DEFAULT_TEMPERATURE if temperature is None else temperature,
         "messages": [{"role": "system", "content": system_prompt}] + messages,
-        "thinking": {"type": "enabled"},
+        "thinking": {"type": "enabled" if thinking else "disabled"},
         "reasoning_effort": reasoning_effort,
     }
     if response_format:
@@ -405,8 +551,20 @@ def _zai_call(system_prompt, messages, max_tokens=1200, temperature=None,
                 data = _with_deadline(_do, deadline_s)
                 if data == "__DEADLINE_EXCEEDED__":
                     if attempt < 2:
+                        # Giving up here does NOT kill the abandoned request -- it's
+                        # still running in _HTTP_EXECUTOR, possibly about to succeed,
+                        # and retrying instantly just fires a second real (billed)
+                        # request on top of it, competing for the same per-model
+                        # concurrency slot it's already holding. A real backoff (same
+                        # policy as the 429 branch below) gives the orphaned attempt a
+                        # head start to actually finish or die on its own inner timeout
+                        # (deadline_s + 10) before a fresh one piles on -- found live:
+                        # a single job retried 3x back-to-back with zero gap took
+                        # 2-3 minutes for what should have been one ~65s call.
                         print(f"[jobs] Z.ai call exceeded {deadline_s}s wall-clock deadline, retrying "
-                              f"(attempt {attempt + 2}/3)", file=sys.stderr)
+                              f"in {delay:.0f}s (attempt {attempt + 2}/3)", file=sys.stderr)
+                        time.sleep(delay)
+                        delay *= 2
                         continue
                     print(f"[jobs] Z.ai call exceeded {deadline_s}s wall-clock deadline on the last "
                           "attempt, giving up", file=sys.stderr)
@@ -667,7 +825,10 @@ def _zai_score_requirements(job, profile, point_bank_items, candidate_years, tun
                 missing.append({"gap": str(g).strip(), "why": "", "example": ""})
         project_assessment = []
         for pa in obj.get("project_assessment", []):
-            row = by_id.get(int(pa.get("item_id", -1)))
+            try:
+                row = by_id.get(int(pa.get("item_id", -1)))
+            except (TypeError, ValueError):
+                continue   # non-numeric hallucinated id -- don't waste the whole call over one bad entry
             if row is None or row["entry_type"] != "project":
                 continue
             project_assessment.append({"row_id": row["id"], "name": row["company"],
@@ -686,7 +847,7 @@ def _zai_score_requirements(job, profile, point_bank_items, candidate_years, tun
 
 
 def _zai_select_content(job, profile, point_bank_items, skill_names, candidate_years, requirements,
-                         forced_project_ids=None, tuning_key="generate_batch"):
+                         forced_project_ids=None, advisory_project_ids=None, tuning_key="generate_batch"):
     """Call 2 of the resume judge/selector split: picks which role items go
     on THIS resume, truthfully rewords them, and picks skills -- grounded
     in Call 1's (_zai_score_requirements) already-computed `requirements`
@@ -695,8 +856,17 @@ def _zai_select_content(job, profile, point_bank_items, skill_names, candidate_y
     called from _score_only, since score-only callers threw this exact work
     away unused every time.
 
-    Content selection is scoped to ROLE items only -- general project
-    worth-including is Call 1's job (advisory, never auto-included here).
+    Role items get their own worth_including judgment here. Projects don't
+    get re-judged here -- inclusion for a project is decided before this
+    call, by one of two things: forced_project_ids (the user explicitly
+    chose it via "Add project to resume") or advisory_project_ids (Call 1
+    already judged it genuinely worth_including for this JD). Once a
+    project is in either set, this call's only job for it is the same
+    truthful reword/JD-vocabulary treatment role items get -- never a
+    second worth-including judgment Call 1 already made. The two sets stay
+    separate for the CALLER (only forced_project_ids is caller-protected
+    from the one-page trim -- an advisory inclusion should be just as
+    trimmable as any other normal item), but are treated identically here.
     forced_project_ids: project item ids the user explicitly chose to
     include via the "Add project to resume" button -- these DO land in
     priority_items regardless of Call 1's relevance judgment, appended
@@ -740,33 +910,44 @@ def _zai_select_content(job, profile, point_bank_items, skill_names, candidate_y
         "nice-to-have requirement) before pure-backfill items. Don't hold back for page-length reasons "
         "-- include everything genuinely worth showing; a separate, real page-count check downstream "
         "trims the list if it runs long, worst-value items first, by the order you give.\n"
-        "   For each item you're including, actively check it against the JD's own vocabulary before "
-        "deciding whether to reword: does the JD name a specific tool, technique, or concept that this "
-        "item genuinely, truthfully demonstrates but describes in different words? If yes, you MUST "
-        "reword it to use the JD's term -- don't skip this because it's extra effort, a truthful match "
-        "left in the candidate's own wording is a real missed opportunity, not a neutral choice. Across "
-        "a real resume this should usually hit at least a few items, not zero -- if you're about to "
-        "return every single item unchanged, go back and actually check each one against the JD's "
-        "vocabulary again before concluding there's truly nothing to swap. Never add a fact, number, or "
-        "outcome that isn't already there -- only swap in a term for something genuinely, truthfully "
-        "present. Once you've actually checked and an item's wording already matches or there's truly "
-        "nothing to swap, do NOT retype its original wording -- the caller already has the original "
-        "text and will use it verbatim; omit the text field entirely for that item, to save you writing "
-        "out text that's already on file unchanged. Every bullet, reworded or not, must carry a real "
-        "named skill/technology and how it was used, and/or a measurable result (a number, a named "
-        "outcome, an award) -- never a bare responsibility with nothing backing it (don't open on "
-        "\"Implemented X\" or \"Worked on Y\" with nothing else). Write every bullet so someone outside "
-        "this exact specialty could still follow what was done and why it mattered -- an unexplained "
-        "acronym or narrow piece of jargon that only a specialist would recognize isn't impressive, "
-        "it's a sentence the reader has to stop and decode. If a technical term is genuinely the right "
-        "word, make sure the surrounding words still carry the real accomplishment on their own. The "
-        "goal is a reader immediately grasping the impact, not a display of domain vocabulary. And any "
-        "wording you do write must follow these rules exactly:\n" + HUMAN_STYLE_RULES + "\n"
-        "   Separately, if the user message below lists any Forced project items, the candidate has "
-        "chosen to include each one on this resume regardless of relevance -- for each, decide only "
-        "whether to reword it (same truthful-reword/JD-vocabulary rule and style rules as role items "
-        "above) and report it under forced_project_items; you are not judging whether to include it, "
-        "only how to word it.\n\n"
+        "   For EVERY item you're including, run TWO separate, independent checks before ever "
+        "considering whether to omit the text field -- these are two different reasons to reword, not "
+        "one, and a pass on either one alone is NOT enough to skip rewording:\n"
+        "   CHECK A (JD vocabulary): does the JD name a specific tool, technique, or concept that this "
+        "item genuinely, truthfully demonstrates but describes in different words? If yes, reword to "
+        "use the JD's term.\n"
+        "   CHECK B (plain language -- the one that gets skipped if you're not deliberate about it): "
+        "read the item's ORIGINAL point-bank wording as if you'd never seen the system before. Would "
+        "someone outside this exact specialty follow what was done and why it mattered on one read? "
+        "Point-bank text is written for the candidate's own records, not for a stranger skimming for a "
+        "few seconds -- it is allowed to be denser or more jargon-heavy than a resume should be, and "
+        "the fact that it's already on file is NOT evidence it's already plain enough. If it leans on "
+        "unexplained acronyms, stacked technical nouns, or a sentence that needs a second read, reword "
+        "it in plainer words even though the facts and the JD-match don't change. This check fires on "
+        "most items in a real resume, not a rare few -- if you are about to leave most of the role "
+        "items unchanged, go back and actually re-read each original sentence as a stranger would "
+        "before concluding it was already plain.\n"
+        "   The text field may ONLY be omitted when BOTH checks come back negative -- no JD-vocabulary "
+        "swap needed AND the original wording is already plain enough for a non-specialist to follow in "
+        "one read. If either check is positive, you must write out the real reworded text, never retype "
+        "the original unchanged and never omit it. Never add a fact, number, or outcome that isn't "
+        "already there -- only reword what's genuinely, truthfully present. Every bullet, reworded or "
+        "not, must carry a real named skill/technology and how it was used, and/or a measurable result "
+        "(a number, a named outcome, an award) -- never a bare responsibility with nothing backing it "
+        "(don't open on \"Implemented X\" or \"Worked on Y\" with nothing else). The goal is a reader "
+        "immediately grasping the impact in a few seconds, not a display of domain vocabulary -- if a "
+        "technical term is genuinely the right word, the surrounding words still have to carry the real "
+        "accomplishment on their own. And any wording you do write must follow these rules exactly:\n"
+        + HUMAN_STYLE_RULES + "\n"
+        "   Separately, if the user message below lists any Project items to include, each one is "
+        "already decided -- either the candidate explicitly chose it, or a separate earlier judgment "
+        "already found it genuinely worth including on this resume. For each, decide only whether to "
+        "reword it (same truthful-reword/JD-vocabulary rule and style rules as role items above) and "
+        "report it under forced_project_items; you are not judging whether to include it, only how to "
+        "word it. The plain-language rule above applies especially hard here -- project "
+        "bullets tend to carry the densest jargon (model/framework names, ML technique acronyms), and "
+        "a reader who doesn't already know that specific stack should still come away understanding "
+        "what was actually built and why it was hard, not just see a wall of technology names.\n\n"
         "2. SKILLS -- from the candidate's tagged skills given below, pick the ones genuinely relevant "
         "to this JD. Only include a \"display\" value when the JD's own exact term is a truthful match "
         "for something the candidate actually tagged and reads better than the original (e.g. "
@@ -777,18 +958,19 @@ def _zai_select_content(job, profile, point_bank_items, skill_names, candidate_y
         "Reply with ONLY a JSON object: {\"role_assessment\": [{\"item_id\": int, \"worth_including\": "
         "bool, \"reason\": str, \"text\": str (OMIT this field entirely, don't send an empty string, "
         "when you're not changing the item's wording)}], \"forced_project_items\": [{\"item_id\": int, "
-        "\"text\": str (OMIT when not changing wording)}] (empty list if none were forced), "
+        "\"text\": str (OMIT when not changing wording)}] (empty list if none were listed), "
         "\"skills\": [{\"name\": str, \"display\": str (OMIT when the original tag name is already "
         "fine)}]}."
     )
     forced = set(forced_project_ids or [])
+    include_ids = forced | set(advisory_project_ids or [])
     forced_note = ""
-    if forced:
-        forced_rows = [p for p in point_bank_items if p["entry_type"] == "project" and p["id"] in forced]
+    if include_ids:
+        forced_rows = [p for p in point_bank_items if p["entry_type"] == "project" and p["id"] in include_ids]
         forced_text = "\n".join(
             f"[id={p['id']} | {p['company']} -- {p['role']}, {p['start_date']} to {p['end_date'] or 'present'}] {p['text']}"
             for p in forced_rows)
-        forced_note = f"\n\nForced project items (id | project -- tagline, dates):\n{forced_text}"
+        forced_note = f"\n\nProject items to include (id | project -- tagline, dates):\n{forced_text}"
     user = (
         f"Candidate: {profile.get('title', '')}, {candidate_years} years of real experience.\n\n"
         f"Role items (id | company -- role, dates):\n{role_items_text}\n\n"
@@ -811,7 +993,14 @@ def _zai_select_content(job, profile, point_bank_items, skill_names, candidate_y
             priority_items = []
             role_assessment = []
             for it in obj.get("role_assessment", []):
-                row = by_id.get(int(it["item_id"]))
+                try:
+                    row = by_id.get(int(it["item_id"]))
+                except (TypeError, ValueError):
+                    # Non-numeric id (seen live: "93_alt_unused") -- the
+                    # model inventing a variant id, never a real row.
+                    # Skip it the same as any other hallucinated id,
+                    # don't let one bad entry crash the whole parse.
+                    continue
                 if row is None or row["entry_type"] != "role":   # hallucinated/stale id, or not a role item -- skip
                     continue
                 worth = bool(it.get("worth_including"))
@@ -821,9 +1010,12 @@ def _zai_select_content(job, profile, point_bank_items, skill_names, candidate_y
                     text = str(it.get("text") or "").strip() or row["text"]
                     priority_items.append({"row_id": row["id"], "text": text, "kind": row["entry_type"]})
             for it in obj.get("forced_project_items", []):
-                row = by_id.get(int(it["item_id"]))
-                if row is None or row["entry_type"] != "project" or row["id"] not in forced:
-                    continue   # projects are advisory-only unless explicitly requested -- enforced here, not trusted from the prompt
+                try:
+                    row = by_id.get(int(it["item_id"]))
+                except (TypeError, ValueError):
+                    continue   # non-numeric hallucinated id -- same tolerance as role_assessment above
+                if row is None or row["entry_type"] != "project" or row["id"] not in include_ids:
+                    continue   # projects only land here if forced or Call-1-approved -- enforced here, not trusted from the prompt
                 text = str(it.get("text") or "").strip() or row["text"]
                 priority_items.append({"row_id": row["id"], "text": text, "kind": row["entry_type"]})
             if not priority_items:
@@ -854,9 +1046,32 @@ def _zai_select_content(job, profile, point_bank_items, skill_names, candidate_y
             messages.append({"role": "user", "content": (
                 "Some bullets fail the style check -- fix these and reply with the same JSON shape, "
                 "nothing else:\n- " + "\n- ".join(violations))})
-    print(f"[jobs] {provider} select-content failed the humanizer gate 3x for job {job['id']}: "
-          f"{violations}", file=sys.stderr)
-    return None
+    # Last attempt still has violations -- one stubborn bullet used to fail the ENTIRE call,
+    # throwing away 9 good reworded items because of 1 the model couldn't fix in 3 tries.
+    # Found live on a real generate. Per-item salvage instead: revert ONLY the still-
+    # violating items to their real, untouched point-bank text (which is independently
+    # checked -- if the ORIGINAL also fails, that one item is dropped, never shipped
+    # unchecked) and keep every other item's successfully reworded text. A slightly-
+    # unpolished real bullet beats failing the whole resume.
+    salvaged, dropped = [], []
+    for it in priority_items:
+        if jobs_humanizer.check_human_style(it["text"]):
+            row = by_id.get(it["row_id"])
+            original = row["text"] if row is not None else ""
+            if original and not jobs_humanizer.check_human_style(original):
+                salvaged.append({**it, "text": original})
+            else:
+                dropped.append(it["row_id"])
+        else:
+            salvaged.append(it)
+    if dropped:
+        print(f"[jobs] {provider} select-content: dropped row_ids {dropped} for job {job['id']} -- "
+              "neither the reworded nor the original text passed the style check", file=sys.stderr)
+    if not salvaged:
+        print(f"[jobs] {provider} select-content failed the humanizer gate 3x for job {job['id']}, "
+              "nothing salvageable", file=sys.stderr)
+        return None
+    return {"priority_items": salvaged, "skills": skills, "role_assessment": role_assessment}
 
 
 def _zai_generate_and_score(job, profile, point_bank_items, skill_names, candidate_years, forced_project_ids=None,
@@ -883,19 +1098,74 @@ def _zai_generate_and_score(job, profile, point_bank_items, skill_names, candida
     scored = _zai_score_requirements(job, profile, point_bank_items, candidate_years, tuning_key=tuning_key)
     if scored is None:
         return None
+    # A project Call 1 already judged genuinely worth_including for this JD now actually
+    # lands on the resume instead of sitting advisory-only until the user manually clicks
+    # "Add to resume" -- found live: a real generate for a distributed-systems posting
+    # produced zero Projects section even though Kapitsa was real, relevant, true work.
+    # Kept separate from forced_project_ids below (not trim-protected) since this is a
+    # relevance call, not something the user explicitly insisted on.
+    #
+    # Explicitly Kapitsa only -- told directly: exactly one project on the resume, and it's
+    # Kapitsa, never Curie (a tool that writes resumes showing up as a bullet ON a resume
+    # reads oddly, and Kapitsa is the stronger, more complete story). Filtered here, not
+    # left to Call 1's own relevance judgment, since Call 1 has in the past judged Curie
+    # worth_including for some postings -- that's no longer a judgment call this makes.
+    advisory_project_ids = {pa["row_id"] for pa in scored["project_assessment"]
+                             if pa["worth_including"] and pa["name"] == "Kapitsa"}
+    # Separately, always OFFER the current Kapitsa row as a low-priority fill candidate
+    # too, even when Call 1 said it's not core-relevant -- real empty space at the bottom
+    # of a page with zero worth_including projects just stayed empty, because a project
+    # never got a chance to be considered unless Call 1 approved it outright. This is
+    # deliberately NOT added to advisory_project_ids (so generate.py's trim-protection
+    # stays limited to genuine approvals) -- a fallback filler should only survive when
+    # there's real spare room, same real-rendered-page-count logic the one-page trim
+    # already uses, never promoted to "must survive even under page pressure."
+    kapitsa_rows = [p for p in point_bank_items
+                    if p["entry_type"] == "project" and p["company"] == "Kapitsa"]
+    fallback_project_ids = {max(kapitsa_rows, key=lambda r: r["id"])["id"]} if kapitsa_rows else set()
     selected = _zai_select_content(job, profile, point_bank_items, skill_names, candidate_years,
                                     scored["requirements"], forced_project_ids=forced_project_ids,
+                                    advisory_project_ids=advisory_project_ids | fallback_project_ids,
                                     tuning_key=tuning_key)
     if selected is None:
         return None
+    priority_items = selected["priority_items"]
+    # Offering a candidate to Call 2 only works if the model actually bothers to emit it --
+    # it's told "you are not judging whether to include it, only how to word it" for every
+    # offered id, but that's a request, not a guarantee. Found live: a real run with real
+    # spare page room (both companies well under the cap) still produced zero project
+    # items, because the model's reply simply never mentioned one despite candidates being
+    # listed. Deterministic backstop: if nothing with kind="project" made it through at
+    # all, append the best available project's real, untouched point-bank text directly --
+    # same spirit as _balance_role_bullets' backfill, a guarantee that doesn't depend on
+    # the model choosing to cooperate.
+    if not any(it["kind"] == "project" for it in priority_items):
+        by_id = {p["id"]: p for p in point_bank_items}
+        fallback_id = next(iter(advisory_project_ids), None) or next(iter(fallback_project_ids), None)
+        row = by_id.get(fallback_id)
+        # Still goes through the same style gate every other bullet does -- this bypasses
+        # Call 2's own already-passed violations check (the raw text was never part of that
+        # reply), so it gets its own check rather than trusting unchecked text onto the page.
+        if row is not None and not jobs_humanizer.check_human_style(row["text"]):
+            priority_items = priority_items + [{"row_id": row["id"], "text": row["text"], "kind": "project"}]
     return {
-        "priority_items": selected["priority_items"],
+        "priority_items": priority_items,
         "requirements": scored["requirements"],
         "project_assessment": scored["project_assessment"],
         "skills": selected["skills"],
         "missing": scored["missing"],
         "score": scored["score"],
         "reason": scored["reason"],
+        # Carried through so generate.py's page-trim never silently drops
+        # a project the user explicitly forced on via "Add to resume" --
+        # Call 2 only decides whether a forced item is included, not where
+        # it ranks, so without this it could still get cut as low-priority.
+        "forced_project_ids": list(forced_project_ids or []),
+        # Genuine Call-1 approvals only (never the fallback-filler ids) --
+        # generate.py uses this to decide which project, if any, earns the
+        # "survive the one-page trim" floor. A fallback filler never does;
+        # it only ever shows up when there's real spare room.
+        "advisory_project_ids": list(advisory_project_ids),
     }
 
 
@@ -942,8 +1212,31 @@ def _zai_draft_application(job, profile, points_text, skill_names, candidate_yea
         "point bank, and real specifics from the posting (the team, the problem, a named "
         "technology) -- not generic enthusiasm.\n\n"
         + HUMAN_STYLE_RULES +
-        "\nResume summary: 1-2 sentences, no greeting, states the candidate's real "
-        "background and seniority plainly.\n"
+        "\nResume summary: exactly 2 sentences, no greeting, same shape every time so it reads "
+        "as one consistent, deliberate statement rather than a different structure each run:\n"
+        "   Sentence 1: years of real experience + the single most impressive, concrete scale "
+        "fact from the point bank (a real number -- data volume, request rate, pipeline count, "
+        "whatever is strongest), tied to whichever company it actually happened at.\n"
+        "   Sentence 2: one more concrete differentiator from a DIFFERENT accomplishment or "
+        "company than sentence 1 used, picked for relevance to THIS posting -- never repeat "
+        "the same fact sentence 1 already used.\n"
+        "   TENSE, checked against the real dates on each point-bank item (every item is "
+        "tagged with its own start/end date): if the role's end date is a real date in the "
+        "past, every accomplishment from it is PAST tense ONLY -- \"built\", \"owned\", \"cut\", "
+        "\"drove\" -- never \"I build\", \"I own\", \"I run\", which claims the candidate is "
+        "currently doing it. Only a role with no end date (still ongoing) may use present "
+        "tense. Check every single role used in the summary before writing -- if ALL the roles "
+        "referenced have already ended, the ENTIRE summary is past tense, with no exceptions "
+        "and no mixing -- writing \"I build X\" about a job that ended months ago misstates the "
+        "candidate's current employment status, which is a real factual error, not a style "
+        "choice. Pick ONE clear, concrete way to describe what the candidate actually did in "
+        "each accomplishment -- never blend two different framings in the same sentence (e.g. "
+        "\"owned the pipelines\" and \"built the platform other teams used\" are two different "
+        "claims; pick whichever is literally true and say only that, plainly, so a reader isn't "
+        "left guessing which one it actually was). Tone is warm and a little humble -- never "
+        "phrase anything as the candidate being able to do what others can't, or any other "
+        "comparison that puts them above unnamed others; let the real facts make the case "
+        "instead of a claim of superiority.\n"
         "Cover letter body: 3-4 short paragraphs, no \"Dear Hiring Manager\" greeting or "
         "sign-off (the renderer adds those), grounded in specific real point-bank facts "
         "connected to specific things this posting actually asks for.\n\n"
@@ -971,6 +1264,15 @@ def _zai_draft_application(job, profile, points_text, skill_names, candidate_yea
             return None, None, f"{provider} reply wasn't valid JSON: {e}"
         violations = (jobs_humanizer.check_human_style(summary)
                       + jobs_humanizer.check_human_style(cover))
+        # An empty/near-empty string trivially passes every style check
+        # above (there's nothing in it to flag) -- found live: a real
+        # resume went out with a blank Summary section because this gate
+        # never actually required non-empty content, just "no bad
+        # patterns in whatever's there, including nothing."
+        if len(summary) < 20:
+            violations.append("summary is empty or too short -- write the real 1-2 sentence summary, not nothing")
+        if len(cover) < 50:
+            violations.append("cover_letter_body is empty or too short -- write the real 3-4 paragraph cover letter, not nothing")
         if not violations:
             return summary, cover, None
         if attempt < 2:
@@ -1201,18 +1503,33 @@ def _run_judge_batch(candidates, profile, point_bank_items, candidate_years):
 
     def run():
         with _judge_lock:
-            for j in candidates:
-                fresh = jobsdb.jobs_get(j["id"])
-                if fresh is not None:
-                    ok, reason = _score_only(fresh, profile, point_bank_items, candidate_years)
-                    if ok:
-                        _judge_progress_update(judged=_judge_progress["judged"] + 1)
-                    else:
+            try:
+                for j in candidates:
+                    try:
+                        fresh = jobsdb.jobs_get(j["id"])
+                        if fresh is not None:
+                            ok, reason = _score_only(fresh, profile, point_bank_items, candidate_years)
+                            if ok:
+                                _judge_progress_update(judged=_judge_progress["judged"] + 1)
+                            else:
+                                _judge_progress_update(failed=_judge_progress["failed"] + [
+                                    {"job_id": fresh["id"], "title": fresh["title"],
+                                     "company": fresh["company"], "reason": reason}])
+                    except Exception as e:
+                        # One job's unexpected exception (DB hiccup, bad row, etc.) must
+                        # never take the rest of the batch down with it -- real bug found
+                        # live: a 429-triggered failure path that raised instead of
+                        # returning, which killed this thread mid-batch and left
+                        # "running": true stuck forever (nothing clears it until the next
+                        # server restart), so every subsequent AI-judge click bounced off
+                        # the one-at-a-time lock looking exactly like "AI-judge is
+                        # broken" when the real batch had silently died minutes in.
+                        print(f"[jobs] judge batch: unexpected error on job {j.get('id')}: {e}", file=sys.stderr)
                         _judge_progress_update(failed=_judge_progress["failed"] + [
-                            {"job_id": fresh["id"], "title": fresh["title"],
-                             "company": fresh["company"], "reason": reason}])
-                _judge_progress_update(done=_judge_progress["done"] + 1)
-            _judge_progress_update(running=False)
+                            {"job_id": j.get("id"), "title": "", "company": "", "reason": f"unexpected error: {e}"}])
+                    _judge_progress_update(done=_judge_progress["done"] + 1)
+            finally:
+                _judge_progress_update(running=False)
     threading.Thread(target=run, daemon=True).start()
     return True
 
@@ -1256,6 +1573,33 @@ def _generate_one(job_id, summary, cover_letter_body, selection):
         return False, f"bad generate_cli output: {out.stdout[-300:]} {out.stderr[-300:]}"
     if "error" in result:
         return False, result["error"][:500]
+    return True, None
+
+
+def _generate_single_job(jid):
+    """The same score->select->draft->render pipeline _run_generate_batch
+    runs per job in a batch, but for exactly one job, synchronous, no
+    forced project -- what the poll script's emailed "Generate now" link
+    triggers. Returns (ok, error_or_None)."""
+    job = jobsdb.jobs_get(jid)
+    if not job:
+        return False, "no such job"
+    profile, skill_names, _bullets_text, _skills_line, candidate_years = _jobs_resume_body()
+    point_bank_items = jobsdb.point_bank_all()
+    selection = _zai_generate_and_score(job, profile, point_bank_items, skill_names,
+                                         candidate_years, tuning_key="generate_single")
+    if selection is None:
+        return False, "content selection/scoring call failed -- see server logs"
+    points_text = _points_text_for_selection(point_bank_items, selection["priority_items"])
+    summary, cover, draft_err = _zai_draft_application(job, profile, points_text, skill_names,
+                                                         candidate_years, tuning_key="generate_single")
+    if summary is None:
+        return False, draft_err
+    ok, err = _generate_one(jid, summary, cover, selection)
+    if not ok:
+        return False, err
+    jobsdb.jobs_set_llm_score(jid, selection["score"], selection["reason"],
+                               missing=selection["missing"], projects=selection["project_assessment"])
     return True, None
 
 
@@ -1459,6 +1803,14 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", "0") or 0)
         return json.loads(self.rfile.read(n) or b"{}")
 
+    def _html(self, body_text, code=200):
+        body = body_text.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _static(self, path, root=STATIC):
         rel = path.lstrip("/") or "index.html"
         full = os.path.normpath(os.path.join(root, rel))
@@ -1502,6 +1854,98 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         p, qs = u.path, parse_qs(u.query)
+
+        if p == "/auth/google/login":
+            # Starts the login flow: a random, single-use state value goes
+            # both into a short-lived cookie and into the URL Google will
+            # echo back on the callback -- the callback refuses to proceed
+            # unless they match, which is what stops a forged callback
+            # request from logging an attacker's code in as a session.
+            state = secrets.token_urlsafe(24)
+            self.send_response(302)
+            self.send_header("Location", _google_auth_redirect_url(state))
+            self.send_header("Set-Cookie", f"oauth_state={state}; Max-Age=600; Path=/; HttpOnly; SameSite=Lax")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if p == "/auth/google/callback":
+            code = qs.get("code", [""])[0]
+            state = qs.get("state", [""])[0]
+            cookie_state = _parse_cookies(self.headers.get("Cookie", "")).get("oauth_state")
+            if not code or not state or not cookie_state or state != cookie_state:
+                return self._html("<h1>Login failed</h1><p>Invalid or expired login attempt -- "
+                                   "try <a href=\"/auth/google/login\">logging in</a> again.</p>", 400)
+            email = _google_exchange_code(code)
+            if not email or email != ALLOWED_LOGIN_EMAIL:
+                return self._html("<h1>Not authorized</h1><p>That Google account isn't allowed to "
+                                   "access this app.</p>", 403)
+            self.send_response(302)
+            self.send_header("Location", "/jobs/")
+            self.send_header("Set-Cookie", f"session={_make_session_cookie(email)}; "
+                              f"Max-Age={SESSION_MAX_AGE}; Path=/; HttpOnly; SameSite=Lax")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if not p.startswith(AUTH_EXEMPT_PREFIXES) and not _valid_session_email(self.headers.get("Cookie", "")):
+            self.send_response(302)
+            self.send_header("Location", "/auth/google/login")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if p == "/api/jobs/generate-link":
+            # The one-click "Generate now" link Telegram-notified by
+            # poll_and_notify.py. Deliberately exempted above from the
+            # Google OAuth gate -- opened fresh from a Telegram message,
+            # not a live logged-in browser session. The HMAC signature IS
+            # the auth here: only a link this server itself signed (via
+            # _sign_job_id, using a secret that never leaves the server)
+            # can trigger a real generate. A plain HTML response, not
+            # JSON -- a human opens this link in a browser, not an API
+            # client.
+            try:
+                jid = int(qs.get("job_id", ["0"])[0])
+            except ValueError:
+                jid = 0
+            sig = qs.get("sig", [""])[0]
+            if not jid or not _verify_job_sig(jid, sig):
+                return self._html("<h1>Invalid or expired link</h1>", 403)
+            ok, err = _generate_single_job(jid)
+            if ok:
+                return self._html(
+                    f"<h1>Generated</h1><p>Resume and cover letter are ready -- "
+                    f"<a href=\"/jobs/\">open the app</a> to download them.</p>")
+            return self._html(f"<h1>Generation failed</h1><p>{err}</p>", 500)
+
+        if p == "/api/jobs/view-details":
+            # The "View JD" button in the Telegram notification -- kept the
+            # full job description and fit reasoning OUT of the message
+            # itself (that's what was making every notification huge), one
+            # tap away instead. Same HMAC-signature auth as generate-link,
+            # same reason it's exempt from the login gate.
+            try:
+                jid = int(qs.get("job_id", ["0"])[0])
+            except ValueError:
+                jid = 0
+            sig = qs.get("sig", [""])[0]
+            if not jid or not _verify_job_sig(jid, sig):
+                return self._html("<h1>Invalid or expired link</h1>", 403)
+            job = jobsdb.jobs_get(jid)
+            if not job:
+                return self._html("<h1>No such job</h1>", 404)
+            import html as _html_lib
+            score = job["llm_score"]
+            score_line = f"<p><b>ATS score: {score:.0f}</b></p>" if score is not None else ""
+            return self._html(
+                f"<h1>{_html_lib.escape(job['title'])}</h1>"
+                f"<p>{_html_lib.escape(job['company'])} &middot; "
+                f"<a href=\"{_html_lib.escape(job.get('url', ''))}\">apply here</a></p>"
+                f"{score_line}"
+                f"<p>{_html_lib.escape(job.get('llm_reason', '') or '(not scored yet)')}</p>"
+                f"<hr><pre style=\"white-space:pre-wrap;font-family:sans-serif\">"
+                f"{_html_lib.escape(job.get('description_raw', ''))}</pre>")
 
         if p == "/api/jobs/list":
             total_unfiltered, matched = _filter_jobs(qs)
@@ -1705,19 +2149,23 @@ class Handler(BaseHTTPRequestHandler):
 
         if p == "/api/jobs/generate-with-project":
             # "Add project to resume" -- a full regenerate (fresh summary +
-            # cover letter, fresh content selection+score), except this one
-            # project id is forced into the content regardless of its own
-            # worth_including verdict. Synchronous: three real LLM calls
-            # (score, select content, draft prose) plus rendering.
+            # cover letter, fresh content selection+score), except these
+            # project ids are forced into the content regardless of their
+            # own worth_including verdict. project_ids: every point-bank
+            # row belonging to the one project being added (a project
+            # with several facts on file is still ONE project -- forcing
+            # only its first row would leave the rest out). Synchronous:
+            # three real LLM calls (score, select content, draft prose)
+            # plus rendering.
             jid = int(b.get("job_id", 0))
-            project_id = int(b.get("project_id", 0))
+            project_ids = [int(x) for x in b.get("project_ids", [])]
             job = jobsdb.jobs_get(jid)
             if not job:
                 return self._json({"error": "no such job"}, 404)
             profile, skill_names, _bullets_text, _skills_line, candidate_years = _jobs_resume_body()
             point_bank_items = jobsdb.point_bank_all()
             selection = _zai_generate_and_score(job, profile, point_bank_items, skill_names,
-                                                 candidate_years, forced_project_ids=[project_id],
+                                                 candidate_years, forced_project_ids=project_ids,
                                                  tuning_key="generate_single")
             if selection is None:
                 return self._json({"error": "content selection/scoring call failed -- see server logs"}, 500)
@@ -1975,6 +2423,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urlparse(self.path)
         p = u.path
+
+        if not p.startswith(AUTH_EXEMPT_PREFIXES) and not _valid_session_email(self.headers.get("Cookie", "")):
+            return self._json({"error": "not logged in"}, 401)
+
         b = self._body()
 
         if p.startswith("/api/jobs/") or p.startswith("/api/applications/") or p.startswith("/api/profile/"):

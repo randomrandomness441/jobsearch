@@ -2,6 +2,12 @@ __pycache__/
 *.pyc
 .venv/
 
+# Real secrets (Zai/Gmail-or-Telegram/Google OAuth/the generate-link
+# signing secret) -- never committed, loaded as env vars either by
+# sourcing this locally or via systemd's EnvironmentFile= on the VPS.
+.env
+.env.*
+
 # Real application data: the working DB (has fetched postings + scores),
 # rendered resumes/cover letters sent to real companies (PII: name, contact
 # info), and generated eval output. None of this is code -- it's personal
