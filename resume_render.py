@@ -29,12 +29,15 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
 PAGE_WIDTH = Inches(8.5)
-MARGIN_TOP_BOTTOM = Inches(0.55)
+MARGIN_TOP_BOTTOM = Inches(0.45)   # was 0.55 -- tightened to fit a full 10-bullet resume plus a
+                                    # project on one page without cutting content (the 0.55 margins
+                                    # plus 9pt section spacing were costing real content for resumes
+                                    # right at the one-page line)
 MARGIN_LEFT_RIGHT = Inches(0.65)
 USABLE_WIDTH = PAGE_WIDTH - MARGIN_LEFT_RIGHT * 2   # where a right-aligned tab stop lands
 
 BODY_SIZE = Pt(10.5)
-SECTION_SPACE_BEFORE = 9     # points -- plain numbers throughout this file, see _tighten
+SECTION_SPACE_BEFORE = 7     # was 9 -- points -- plain numbers throughout this file, see _tighten
 SECTION_SPACE_AFTER = 3
 LINE_SPACE_AFTER = 1
 

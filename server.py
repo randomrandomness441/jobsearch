@@ -1130,6 +1130,18 @@ def _zai_generate_and_score(job, profile, point_bank_items, skill_names, candida
     if selected is None:
         return None
     priority_items = selected["priority_items"]
+    # "Exactly one project on the resume" is the rule -- but Call 2 is offered
+    # forced_project_ids AND advisory_project_ids as separate candidate lists, and
+    # nothing stopped it from including more than one if it judged several relevant.
+    # Found live: a real run included both the forced Kapitsa row and the fallback
+    # Kapitsa row, inflating the Projects section to 2 bullets and squeezing role
+    # bullets out of the one-page budget. Hard cap at one here, preferring whichever
+    # row was actually forced (an explicit user insistence beats the model's own pick).
+    project_items = [it for it in priority_items if it["kind"] == "project"]
+    if len(project_items) > 1:
+        forced_set = set(forced_project_ids or [])
+        keep = next((it for it in project_items if it["row_id"] in forced_set), project_items[0])
+        priority_items = [it for it in priority_items if it["kind"] != "project"] + [keep]
     # Offering a candidate to Call 2 only works if the model actually bothers to emit it --
     # it's told "you are not judging whether to include it, only how to word it" for every
     # offered id, but that's a request, not a guarantee. Found live: a real run with real

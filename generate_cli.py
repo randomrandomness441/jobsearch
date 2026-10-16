@@ -17,9 +17,12 @@ Prints one JSON line to stdout: {"folder": str, "ats": {...}} on success,
 not the exit code, so a bad job_id comes back as data, not a stack trace).
 """
 import json
+import os
 import sys
 
+import db
 import generate
+import validate
 
 
 def main():
@@ -29,7 +32,19 @@ def main():
     except Exception as e:
         print(json.dumps({"error": str(e)}))
         return
-    print(json.dumps({"folder": result["folder"], "ats": result["ats"]}))
+
+    selection = req["selection"]
+    checklist = validate.build_checklist(
+        selection["priority_items"], result["roles"], result["projects"],
+        req["summary"], req["cover_letter_body"], db.point_bank_all(),
+        result["ats"]["rendered_pages"], requirements=selection.get("requirements"),
+        max_pages=generate.MAX_PAGES)
+    with open(os.path.join(result["folder"], "validation_checklist.md"), "w") as f:
+        f.write(validate.render_checklist_md(checklist))
+
+    print(json.dumps({"folder": result["folder"], "ats": result["ats"],
+                       "checklist_passed": sum(1 for c in checklist if c["ok"]),
+                       "checklist_total": len(checklist)}))
 
 
 if __name__ == "__main__":
