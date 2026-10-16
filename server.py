@@ -1987,6 +1987,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._html(
                     f"<h1>Generated</h1><p>Resume and cover letter are ready -- "
                     f"<a href=\"/jobs/\">open the app</a> to download them.</p>")
+            # Log the real reason regardless of whether the client is still connected --
+            # found live: a slow generate (large JD, several retries) outlasted the
+            # browser's own patience, so by the time this tried to WRITE the error back,
+            # the client had already disconnected (BrokenPipeError), and the actual
+            # reason was never visible anywhere except inside that unsent HTML body.
+            print(f"[jobs] generate-link failed for job {jid}: {err}", file=sys.stderr)
             return self._html(f"<h1>Generation failed</h1><p>{err}</p>", 500)
 
         if p == "/api/jobs/view-details":
@@ -2238,6 +2244,7 @@ class Handler(BaseHTTPRequestHandler):
                                                  candidate_years, forced_project_ids=project_ids,
                                                  tuning_key="generate_single")
             if selection is None:
+                print(f"[jobs] generate-with-project: selection call failed for job {jid}", file=sys.stderr)
                 return self._json({"error": "content selection/scoring call failed -- see server logs"}, 500)
             # Scoped to only the items actually selected for the resume --
             # was the entire point bank, drafted BEFORE content selection
@@ -2247,9 +2254,14 @@ class Handler(BaseHTTPRequestHandler):
             summary, cover, draft_err = _zai_draft_application(job, profile, points_text, skill_names,
                                                                  candidate_years, tuning_key="generate_single")
             if summary is None:
+                # Logged here, not just returned -- a slow request (several LLM retries)
+                # can outlast the client's own patience, and the real reason was
+                # otherwise only ever visible inside a JSON body nothing ever read.
+                print(f"[jobs] generate-with-project: draft failed for job {jid}: {draft_err}", file=sys.stderr)
                 return self._json({"error": draft_err}, 500)
             ok, err = _generate_one(jid, summary, cover, selection)
             if not ok:
+                print(f"[jobs] generate-with-project: render failed for job {jid}: {err}", file=sys.stderr)
                 return self._json({"error": err}, 500)
             jobsdb.jobs_set_llm_score(jid, selection["score"], selection["reason"],
                                        missing=selection["missing"], projects=selection["project_assessment"],
