@@ -33,7 +33,9 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
+import uuid
 
 import ats
 import db
@@ -373,17 +375,33 @@ def _page_count(pdf_path):
     return None
 
 
+def _convert_to_pdf(docx_path, folder, timeout=120):
+    """soffice --headless --convert-to pdf, with its OWN throwaway user
+    profile directory every single call. Without -env:UserInstallation,
+    every invocation -- across every request, forever -- shares the one
+    default LibreOffice profile and its lock file. Found live on the VPS:
+    an earlier too-short outer timeout killed a generate_cli.py subprocess
+    mid-conversion, but Python's subprocess.run(timeout=) only kills its
+    DIRECT child -- the soffice process generate_cli.py had itself spawned
+    was orphaned, kept running, and kept holding that shared lock, quietly
+    hanging every later conversion (even in unrelated requests) behind it.
+    An isolated profile per call means no process, orphaned or not, can
+    ever block another one -- the actual fix, not just a longer timeout."""
+    profile_dir = os.path.join(tempfile.gettempdir(), f"lo_profile_{uuid.uuid4().hex}")
+    try:
+        subprocess.run(
+            ["soffice", "--headless", f"-env:UserInstallation=file://{profile_dir}",
+             "--convert-to", "pdf", "--outdir", folder, docx_path],
+            capture_output=True, timeout=timeout)
+    finally:
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+
 def _render_and_count(profile, resume_title, summary, roles, skills_by_category, folder, projects=None):
     docx_path = os.path.join(folder, "resume.docx")
     pdf_path = os.path.join(folder, "resume.pdf")
     resume_render.render(profile, resume_title, summary, roles, skills_by_category, docx_path, projects=projects)
-    # 120s, was 60 -- too tight on a slower/resource-constrained VPS, especially since the
-    # one-page trim loop can call this several times in one generate; found live: a real
-    # VPS generate completed the resume fine but silently died here before ever reaching
-    # the cover letter, raising subprocess.TimeoutExpired that generate_cli.py's own
-    # except-and-return swallowed into a plain {"error": ...} reply.
-    subprocess.run(["soffice", "--headless", "--convert-to", "pdf", "--outdir", folder, docx_path],
-                    capture_output=True, timeout=120)
+    _convert_to_pdf(docx_path, folder)
     return docx_path, pdf_path, _page_count(pdf_path)
 
 
@@ -590,9 +608,7 @@ def generate(job_id, summary, cover_letter_body, selection, out_root="data/appli
 
     cover_docx = os.path.join(folder, "cover_letter.docx")
     resume_render.render_cover_letter_docx(profile, job["company"], job["title"], cover_letter_body, cover_docx)
-    # 120s, was 60 -- see the matching comment on the resume's own soffice call above.
-    subprocess.run(["soffice", "--headless", "--convert-to", "pdf", "--outdir", folder, cover_docx],
-                    capture_output=True, timeout=120)
+    _convert_to_pdf(cover_docx, folder)
     cover_pdf = os.path.join(folder, "cover_letter.pdf")
 
     with open(os.path.join(folder, "job_description.md"), "w") as f:
