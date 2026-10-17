@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 import re
 import secrets
 import subprocess
@@ -1629,52 +1630,68 @@ _generate_lock = threading.Lock()
 _generate_progress = {"running": False, "total": 0, "done": 0, "generated": 0,
                        "failed": [], "started_ts": None}
 
-# Single-job ids currently being generated in the background (the Telegram "Generate
-# now" link's own queue) -- guarded by its own lock since it's touched from request
-# handler threads, not just the one batch-runner thread _generate_lock already covers.
-_generating_job_ids = set()
-_generating_lock = threading.Lock()
+# ONE real queue, ONE persistent worker thread (started once in main(), below) --
+# every generate request in the whole app funnels through this, full stop: the
+# Telegram "Generate now" link, the web UI's single "Add project to resume"
+# button, and the "Generate queued" batch. Replaced three separate mechanisms
+# (a raw per-click thread spawn with no concurrency bound at all, a blocking
+# synchronous request, and a dedicated batch-only thread) with this one.
+# Strictly serial on purpose -- real resource ceiling (one soffice process, one
+# set of LLM calls, at a time) regardless of how many requests arrive at once,
+# which the old per-click-thread version had no protection against whatsoever:
+# ten quick Telegram clicks would have spawned ten simultaneous pipelines.
+_generate_queue = queue.Queue()
+_generate_status = {}        # job_id -> {"state", "error", "queued_ts", "done_ts"}
+_generate_status_lock = threading.Lock()
 
 
-def _start_single_generate_async(jid):
-    """Kicks off _generate_single_job(jid) on a background thread and returns
-    immediately -- the real fix for "clicking Generate from Telegram hangs the
-    whole request for 1-3 minutes". Returns one of "started", "already_running",
-    or "noop" (already generated, nothing changed since -- see _needs_regenerate),
-    so the caller can give an immediate, honest response instead of blocking.
-    On completion, always sends a follow-up Telegram message -- success with real
-    download links, or a real failure reason -- instead of the click itself ever
-    having to wait for an answer."""
+def _generate_worker_loop():
+    while True:
+        task = _generate_queue.get()
+        jid = task["job_id"]
+        with _generate_status_lock:
+            _generate_status[jid]["state"] = "running"
+        try:
+            ok, err = _generate_single_job(jid, forced_project_ids=task.get("forced_project_ids"))
+        except Exception as e:
+            ok, err = False, f"unexpected error: {e}"
+        with _generate_status_lock:
+            _generate_status[jid]["state"] = "done" if ok else "failed"
+            _generate_status[jid]["error"] = err
+            _generate_status[jid]["done_ts"] = time.time()
+        if task.get("notify_telegram"):
+            fresh = jobsdb.jobs_get(jid)
+            if ok and fresh is not None:
+                sig = _sign_job_id(jid)
+                resume_url = f"{_public_base_url()}/api/jobs/download-resume?job_id={jid}&sig={sig}"
+                cover_url = f"{_public_base_url()}/api/jobs/download-cover?job_id={jid}&sig={sig}"
+                notify_telegram.send_generation_complete(fresh, resume_url, cover_url)
+            else:
+                print(f"[jobs] queued generate failed for job {jid}: {err}", file=sys.stderr)
+                if fresh is not None:
+                    notify_telegram.send_generation_failed(fresh, err)
+        _generate_queue.task_done()
+
+
+def _enqueue_generate(jid, forced_project_ids=None, notify_telegram_on_done=False):
+    """The one entry point every caller funnels through. Returns "no_such_job",
+    "noop" (already generated, unchanged -- see _needs_regenerate; skipped when
+    forced_project_ids is given, same reasoning as _generate_single_job),
+    "already_running" (already queued or actively generating -- never a
+    duplicate), or "started"."""
     job = jobsdb.jobs_get(jid)
     if job is None:
         return "no_such_job"
-    if not _needs_regenerate(job):
+    if not forced_project_ids and not _needs_regenerate(job):
         return "noop"
-    with _generating_lock:
-        if jid in _generating_job_ids:
+    with _generate_status_lock:
+        existing = _generate_status.get(jid)
+        if existing is not None and existing["state"] in ("queued", "running"):
             return "already_running"
-        _generating_job_ids.add(jid)
-
-    def run():
-        try:
-            ok, err = _generate_single_job(jid)
-        except Exception as e:
-            ok, err = False, f"unexpected error: {e}"
-        finally:
-            with _generating_lock:
-                _generating_job_ids.discard(jid)
-        fresh = jobsdb.jobs_get(jid)
-        if ok and fresh is not None:
-            sig = _sign_job_id(jid)
-            resume_url = f"{_public_base_url()}/api/jobs/download-resume?job_id={jid}&sig={sig}"
-            cover_url = f"{_public_base_url()}/api/jobs/download-cover?job_id={jid}&sig={sig}"
-            notify_telegram.send_generation_complete(fresh, resume_url, cover_url)
-        else:
-            print(f"[jobs] async generate failed for job {jid}: {err}", file=sys.stderr)
-            if fresh is not None:
-                notify_telegram.send_generation_failed(fresh, err)
-
-    threading.Thread(target=run, daemon=True).start()
+        _generate_status[jid] = {"state": "queued", "error": None,
+                                  "queued_ts": time.time(), "done_ts": None}
+    _generate_queue.put({"job_id": jid, "forced_project_ids": forced_project_ids,
+                          "notify_telegram": notify_telegram_on_done})
     return "started"
 
 
@@ -1743,22 +1760,27 @@ def _needs_regenerate(job):
     return job["llm_judged_ts"] > draft["generated_ts"]
 
 
-def _generate_single_job(jid):
+def _generate_single_job(jid, forced_project_ids=None):
     """The same score->select->draft->render pipeline _run_generate_batch
-    runs per job in a batch, but for exactly one job, synchronous, no
-    forced project -- what the poll script's emailed "Generate now" link
-    triggers. Returns (ok, error_or_None). A no-op success (True, None) if
+    runs per job in a batch, but for exactly one job -- what the poll
+    script's emailed "Generate now" link triggers, and (via
+    forced_project_ids) what the web UI's "Add project to resume" button
+    triggers too, now the same one function instead of two separate code
+    paths. Returns (ok, error_or_None). A no-op success (True, None) if
     the job is already generated and hasn't been rescored since -- see
-    _needs_regenerate."""
+    _needs_regenerate (skipped entirely when forced_project_ids is given,
+    since forcing a specific project is always an explicit, deliberate
+    regenerate request, never a repeat click to de-duplicate)."""
     job = jobsdb.jobs_get(jid)
     if not job:
         return False, "no such job"
-    if not _needs_regenerate(job):
+    if not forced_project_ids and not _needs_regenerate(job):
         return True, None
     profile, skill_names, _bullets_text, _skills_line, candidate_years = _jobs_resume_body()
     point_bank_items = jobsdb.point_bank_all()
     selection = _zai_generate_and_score(job, profile, point_bank_items, skill_names,
-                                         candidate_years, tuning_key="generate_single")
+                                         candidate_years, forced_project_ids=forced_project_ids,
+                                         tuning_key="generate_single")
     if selection is None:
         return False, "content selection/scoring call failed -- see server logs"
     points_text = _points_text_for_selection(point_bank_items, selection["priority_items"])
@@ -1775,64 +1797,67 @@ def _generate_single_job(jid):
     return True, None
 
 
-def _run_generate_batch(candidates, profile, point_bank_items, skill_names, candidate_years):
+def _run_generate_batch(candidates):
     """candidates: queued jobs. Returns False without starting anything if
     a batch is already running -- same one-at-a-time rule the judge batch
     uses, so two clicks don't double-draft the same jobs.
 
-    point_bank_items: jobsdb.point_bank_all() rows (for
-    _zai_generate_and_score, which needs real ids/entry_type).
-    _zai_generate_and_score runs BEFORE _zai_draft_application (the cover
-    letter) -- the cover letter is scoped via _points_text_for_selection to
-    only the items actually selected for the resume, instead of seeing the
-    entire point bank and risking a fact the resume itself doesn't include."""
+    Enqueues every candidate onto the SAME single shared generate queue
+    _enqueue_generate() funnels every other generate request through (the
+    Telegram link, the web UI's single "Add project to resume" button) --
+    this used to run its own dedicated worker thread, which meant a batch
+    and a Telegram click could run real LLM+soffice pipelines concurrently
+    with no coordination at all. Now everything is strictly serial through
+    the one shared worker; this function just enqueues the whole candidate
+    list and watches _generate_status to keep /api/jobs/generate-queued/
+    status's existing {running, total, done, generated, failed} response
+    shape working exactly as the UI already expects, so no frontend change
+    was needed for the batch flow specifically."""
     if _generate_progress["running"]:
         return False
-    _generate_progress.update({"running": True, "total": len(candidates), "done": 0,
+    fresh_candidates = [jobsdb.jobs_get(j["id"]) for j in candidates]
+    job_ids = [j["id"] for j in fresh_candidates if j is not None and j["status"] == "queued"]
+    _generate_progress.update({"running": True, "total": len(job_ids), "done": 0,
                                 "generated": 0, "failed": [], "started_ts": time.time()})
+    pending = set()
+    for jid in job_ids:
+        state = _enqueue_generate(jid, notify_telegram_on_done=False)
+        if state in ("started", "already_running"):
+            pending.add(jid)
+        else:   # "noop" or "no_such_job" -- already resolved, nothing to wait on
+            job = jobsdb.jobs_get(jid)
+            _generate_progress["done"] += 1
+            if state == "noop":
+                _generate_progress["generated"] += 1
+            else:
+                _generate_progress["failed"].append(
+                    {"job_id": jid, "title": job["title"] if job else "",
+                     "company": job["company"] if job else "", "reason": state})
 
-    def run():
-        with _generate_lock:
-            for j in candidates:
-                fresh = jobsdb.jobs_get(j["id"])
-                if fresh is not None and fresh["status"] == "queued":
-                    selection = _zai_generate_and_score(
-                        fresh, profile, point_bank_items, skill_names, candidate_years)
-                    if selection is None:
-                        print(f"[jobs] generate-queued: selection call failed for job {fresh['id']}",
-                              file=sys.stderr)
-                        _generate_progress["failed"].append(
-                            {"job_id": fresh["id"], "title": fresh["title"], "company": fresh["company"],
-                             "reason": "content selection/scoring call failed -- see server logs"})
-                        _generate_progress["done"] += 1
-                        continue
-                    points_text = _points_text_for_selection(point_bank_items, selection["priority_items"])
-                    summary, cover, draft_err = _zai_draft_application(
-                        fresh, profile, points_text, skill_names, candidate_years)
-                    if summary is None:
-                        print(f"[jobs] generate-queued: draft failed for job {fresh['id']}: {draft_err}",
-                              file=sys.stderr)
-                        _generate_progress["failed"].append(
-                            {"job_id": fresh["id"], "title": fresh["title"],
-                             "company": fresh["company"], "reason": draft_err})
-                        _generate_progress["done"] += 1
-                        continue
-                    ok, err = _generate_one(fresh["id"], summary, cover, selection)
-                    if ok:
+    def track():
+        remaining = set(pending)
+        while remaining:
+            time.sleep(1)
+            finished = set()
+            for jid in remaining:
+                with _generate_status_lock:
+                    st = dict(_generate_status.get(jid) or {})
+                if st.get("state") in ("done", "failed"):
+                    finished.add(jid)
+                    _generate_progress["done"] += 1
+                    if st["state"] == "done":
                         _generate_progress["generated"] += 1
-                        jobsdb.jobs_set_llm_score(fresh["id"], selection["score"], selection["reason"],
-                                                   missing=selection["missing"],
-                                                   projects=selection["project_assessment"],
-                                                   requirements=selection["requirements"])
                     else:
-                        print(f"[jobs] generate-queued: render failed for job {fresh['id']}: {err}",
-                              file=sys.stderr)
+                        job = jobsdb.jobs_get(jid)
                         _generate_progress["failed"].append(
-                            {"job_id": fresh["id"], "title": fresh["title"],
-                             "company": fresh["company"], "reason": err})
-                _generate_progress["done"] += 1
-            _generate_progress["running"] = False
-    threading.Thread(target=run, daemon=True).start()
+                            {"job_id": jid, "title": job["title"] if job else "",
+                             "company": job["company"] if job else "", "reason": st.get("error")})
+            remaining -= finished
+        _generate_progress["running"] = False
+    if pending:
+        threading.Thread(target=track, daemon=True).start()
+    else:
+        _generate_progress["running"] = False
     return True
 
 
@@ -2114,7 +2139,7 @@ class Handler(BaseHTTPRequestHandler):
             # work in the background and respond immediately; a follow-up Telegram
             # message with real download links (or a real failure reason) arrives
             # once it's actually done, never making the click itself wait.
-            state = _start_single_generate_async(jid)
+            state = _enqueue_generate(jid, notify_telegram_on_done=True)
             job = jobsdb.jobs_get(jid)
             title = f"{job['title']} @ {job['company']}" if job else f"job {jid}"
             if state == "noop":
@@ -2226,6 +2251,18 @@ class Handler(BaseHTTPRequestHandler):
 
         if p == "/api/jobs/generate-queued/status":
             return self._json(dict(_generate_progress))
+
+        if p == "/api/jobs/generate-status":
+            # Polled by the web UI after generate-with-project (and could be
+            # polled for any job_id, including one kicked off via Telegram) --
+            # {"state": "queued"|"running"|"done"|"failed"|"unknown", "error": str|None}.
+            # "unknown" means nothing has ever been enqueued for this job_id in
+            # this server's lifetime (e.g. it finished before a restart, or was
+            # never queued at all) -- a genuinely different state from "failed".
+            jid = int(qs.get("job_id", ["0"])[0])
+            with _generate_status_lock:
+                st = dict(_generate_status.get(jid) or {"state": "unknown", "error": None})
+            return self._json(st)
 
         if p == "/api/jobs/detail":
             jid = int(qs.get("id", ["0"])[0])
@@ -2380,43 +2417,17 @@ class Handler(BaseHTTPRequestHandler):
             # own worth_including verdict. project_ids: every point-bank
             # row belonging to the one project being added (a project
             # with several facts on file is still ONE project -- forcing
-            # only its first row would leave the rest out). Synchronous:
-            # three real LLM calls (score, select content, draft prose)
-            # plus rendering.
+            # only its first row would leave the rest out). Async, same as
+            # every other generate path now -- enqueued onto the one shared
+            # worker (_enqueue_generate) instead of blocking this request
+            # for however long 3 real LLM calls plus rendering take. The
+            # frontend polls /api/jobs/generate-status for this job_id.
             jid = int(b.get("job_id", 0))
             project_ids = [int(x) for x in b.get("project_ids", [])]
-            job = jobsdb.jobs_get(jid)
-            if not job:
+            state = _enqueue_generate(jid, forced_project_ids=project_ids)
+            if state == "no_such_job":
                 return self._json({"error": "no such job"}, 404)
-            profile, skill_names, _bullets_text, _skills_line, candidate_years = _jobs_resume_body()
-            point_bank_items = jobsdb.point_bank_all()
-            selection = _zai_generate_and_score(job, profile, point_bank_items, skill_names,
-                                                 candidate_years, forced_project_ids=project_ids,
-                                                 tuning_key="generate_single")
-            if selection is None:
-                print(f"[jobs] generate-with-project: selection call failed for job {jid}", file=sys.stderr)
-                return self._json({"error": "content selection/scoring call failed -- see server logs"}, 500)
-            # Scoped to only the items actually selected for the resume --
-            # was the entire point bank, drafted BEFORE content selection
-            # had even run, so the cover letter could reference a fact the
-            # resume itself didn't include.
-            points_text = _points_text_for_selection(point_bank_items, selection["priority_items"])
-            summary, cover, draft_err = _zai_draft_application(job, profile, points_text, skill_names,
-                                                                 candidate_years, tuning_key="generate_single")
-            if summary is None:
-                # Logged here, not just returned -- a slow request (several LLM retries)
-                # can outlast the client's own patience, and the real reason was
-                # otherwise only ever visible inside a JSON body nothing ever read.
-                print(f"[jobs] generate-with-project: draft failed for job {jid}: {draft_err}", file=sys.stderr)
-                return self._json({"error": draft_err}, 500)
-            ok, err = _generate_one(jid, summary, cover, selection)
-            if not ok:
-                print(f"[jobs] generate-with-project: render failed for job {jid}: {err}", file=sys.stderr)
-                return self._json({"error": err}, 500)
-            jobsdb.jobs_set_llm_score(jid, selection["score"], selection["reason"],
-                                       missing=selection["missing"], projects=selection["project_assessment"],
-                                       requirements=selection["requirements"])
-            return self._json({"ok": True})
+            return self._json({"state": state})
 
         if p == "/api/jobs/clear-llm-scores":
             # Explicit "force reload" -- wipes AI scores so the next
@@ -2431,11 +2442,8 @@ class Handler(BaseHTTPRequestHandler):
             # _run_generate_batch); each one costs three real Zai calls now
             # (score requirements, select+word the content, then draft the
             # summary/cover letter prose).
-            profile, skill_names, _bullets_text, _skills_line, candidate_years = _jobs_resume_body()
-            point_bank_items = jobsdb.point_bank_all()
             candidates = [j for j in jobsdb.jobs_list() if j["status"] == "queued"]
-            started = _run_generate_batch(candidates, profile, point_bank_items,
-                                           skill_names, candidate_years)
+            started = _run_generate_batch(candidates)
             if not started:
                 return self._json({"error": "A generate batch is already running"}, 409)
             return self._json({"started": True, "candidates": len(candidates)})
@@ -2671,6 +2679,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # The one persistent generate worker -- started once, runs forever, strictly
+    # serial. Every generate request in the app (Telegram, web UI single-job,
+    # web UI batch) goes through _enqueue_generate() into the same queue this
+    # single thread drains.
+    threading.Thread(target=_generate_worker_loop, daemon=True).start()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     srv.daemon_threads = True
     print(f"jobsearch  ->  http://{HOST}:{PORT}")

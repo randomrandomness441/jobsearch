@@ -294,7 +294,26 @@ async function openJob(id) {
       btn.disabled = true; btn.textContent = 'Adding…';
       const res = await post('/api/jobs/generate-with-project', {job_id: j.id, project_ids: rowIds});
       if (res.error) { flashCount(res.error); btn.disabled = false; btn.textContent = 'Add to resume'; return; }
-      flashCount('Project added -- resume regenerated.');
+      // Async now -- the server enqueues the real regenerate (3 LLM calls plus
+      // rendering, can take a couple of minutes) onto one shared worker instead of
+      // blocking this request, so the response here is just "started"/"already_running",
+      // not the finished result. Poll the same way the "Generate queued" batch flow
+      // already does, and just show the files once the page refreshes -- no separate
+      // notification needed here, the person's already looking at this page.
+      while (true) {
+        await new Promise(r => setTimeout(r, 1500));
+        const st = await api(`/api/jobs/generate-status?job_id=${j.id}`);
+        if (st.state === 'done') {
+          flashCount('Project added -- resume regenerated.');
+          break;
+        }
+        if (st.state === 'failed') {
+          flashCount(st.error || 'Generation failed -- see server logs');
+          break;
+        }
+        btn.textContent = st.state === 'running' ? 'Generating…' : 'Queued…';
+      }
+      btn.disabled = false; btn.textContent = 'Add to resume';
       openJob(id); loadJobs();
       if (document.getElementById('view-applications').hidden === false) loadApplications();
     };
