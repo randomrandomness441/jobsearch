@@ -61,8 +61,15 @@ def fetch_new_postings():
                           text=True, timeout=600, cwd=ROOT)
     if out.returncode != 0:
         print(f"[poll] fetch failed (exit {out.returncode}): {out.stderr[-500:]}", file=sys.stderr)
-    else:
-        print(f"[poll] fetch ok: {out.stdout.strip().splitlines()[-1] if out.stdout.strip() else '(no output)'}")
+        return False
+    # Was logging ONLY the last line (the one-line summary) and silently discarding
+    # fetch_ats.py's full per-company output -- found live: with that, poll.log could
+    # never show WHICH of the ~96 companies actually succeeded, errored, or returned
+    # zero postings, even on a run where something was genuinely wrong with specific
+    # boards. Log the whole thing (per-company lines + the real summary), so a bad
+    # stretch is visible in poll.log itself, not just inferable from the one number.
+    print(out.stdout.strip() or "[poll] fetch ok but produced no output at all")
+    return True
     return out.returncode == 0
 
 
