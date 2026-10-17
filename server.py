@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import db as jobsdb
 import ats as jobs_ats
 import humanizer as jobs_humanizer
+import notify_telegram
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(ROOT, "static")
@@ -233,7 +234,8 @@ GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
 # (_verify_job_sig) -- that's the whole point of them being one-click links
 # from a Telegram notification, not something that requires first being
 # logged in.
-AUTH_EXEMPT_PREFIXES = ("/auth/google/", "/api/jobs/generate-link", "/api/jobs/view-details")
+AUTH_EXEMPT_PREFIXES = ("/auth/google/", "/api/jobs/generate-link", "/api/jobs/view-details",
+                         "/api/jobs/download-resume", "/api/jobs/download-cover")
 
 
 def _make_session_cookie(email):
@@ -1627,6 +1629,62 @@ _generate_lock = threading.Lock()
 _generate_progress = {"running": False, "total": 0, "done": 0, "generated": 0,
                        "failed": [], "started_ts": None}
 
+# Single-job ids currently being generated in the background (the Telegram "Generate
+# now" link's own queue) -- guarded by its own lock since it's touched from request
+# handler threads, not just the one batch-runner thread _generate_lock already covers.
+_generating_job_ids = set()
+_generating_lock = threading.Lock()
+
+
+def _start_single_generate_async(jid):
+    """Kicks off _generate_single_job(jid) on a background thread and returns
+    immediately -- the real fix for "clicking Generate from Telegram hangs the
+    whole request for 1-3 minutes". Returns one of "started", "already_running",
+    or "noop" (already generated, nothing changed since -- see _needs_regenerate),
+    so the caller can give an immediate, honest response instead of blocking.
+    On completion, always sends a follow-up Telegram message -- success with real
+    download links, or a real failure reason -- instead of the click itself ever
+    having to wait for an answer."""
+    job = jobsdb.jobs_get(jid)
+    if job is None:
+        return "no_such_job"
+    if not _needs_regenerate(job):
+        return "noop"
+    with _generating_lock:
+        if jid in _generating_job_ids:
+            return "already_running"
+        _generating_job_ids.add(jid)
+
+    def run():
+        try:
+            ok, err = _generate_single_job(jid)
+        except Exception as e:
+            ok, err = False, f"unexpected error: {e}"
+        finally:
+            with _generating_lock:
+                _generating_job_ids.discard(jid)
+        fresh = jobsdb.jobs_get(jid)
+        if ok and fresh is not None:
+            sig = _sign_job_id(jid)
+            resume_url = f"{_public_base_url()}/api/jobs/download-resume?job_id={jid}&sig={sig}"
+            cover_url = f"{_public_base_url()}/api/jobs/download-cover?job_id={jid}&sig={sig}"
+            notify_telegram.send_generation_complete(fresh, resume_url, cover_url)
+        else:
+            print(f"[jobs] async generate failed for job {jid}: {err}", file=sys.stderr)
+            if fresh is not None:
+                notify_telegram.send_generation_failed(fresh, err)
+
+    threading.Thread(target=run, daemon=True).start()
+    return "started"
+
+
+def _public_base_url():
+    """The real public address to build a Telegram-clickable link from --
+    JOBSEARCH_BASE_URL is already the one source of truth poll_and_notify.py
+    uses for this exact purpose (set in .env to the VPS's real address, since
+    this process has no other way to know it isn't just localhost)."""
+    return os.environ.get("JOBSEARCH_BASE_URL", f"http://localhost:{PORT}")
+
 
 def _generate_one(job_id, summary, cover_letter_body, selection):
     """Shells into this project's own .venv the same way the manual
@@ -1971,6 +2029,21 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _serve_signed_job_file(self, jid, sig, filename):
+        """resume.pdf / cover_letter.pdf for one job, via the same HMAC-signature
+        auth as generate-link/view-details -- a Telegram download link, not a
+        logged-in browser session. The real folder comes from the applications
+        table (the most recent one for this job), never trusted from the URL,
+        so this can't be used to probe for arbitrary files."""
+        if not jid or not _verify_job_sig(jid, sig):
+            return self._html("<h1>Invalid or expired link</h1>", 403)
+        apps = jobsdb.applications_for_job(jid)
+        if not apps:
+            return self._html("<h1>Not generated yet</h1>", 404)
+        full = os.path.join(apps[0]["folder_path"], filename)
+        rel = os.path.relpath(full, APPLICATIONS)
+        return self._serve_application_file(rel)
+
     # -- routing
     def do_GET(self):
         u = urlparse(self.path)
@@ -2033,18 +2106,44 @@ class Handler(BaseHTTPRequestHandler):
             sig = qs.get("sig", [""])[0]
             if not jid or not _verify_job_sig(jid, sig):
                 return self._html("<h1>Invalid or expired link</h1>", 403)
-            ok, err = _generate_single_job(jid)
-            if ok:
+            # Async, not synchronous -- a real generate is 3 LLM calls plus rendering,
+            # 1-3+ minutes on this hardware, and the old version blocked the whole
+            # request on it. Found live: that routinely outlasted the browser/Telegram
+            # in-app browser's own patience, which gave up and disconnected
+            # (BrokenPipeError) before ever seeing the real result. Now: kick off the
+            # work in the background and respond immediately; a follow-up Telegram
+            # message with real download links (or a real failure reason) arrives
+            # once it's actually done, never making the click itself wait.
+            state = _start_single_generate_async(jid)
+            job = jobsdb.jobs_get(jid)
+            title = f"{job['title']} @ {job['company']}" if job else f"job {jid}"
+            if state == "noop":
+                sig2 = _sign_job_id(jid)
+                resume_url = f"{_public_base_url()}/api/jobs/download-resume?job_id={jid}&sig={sig2}"
+                cover_url = f"{_public_base_url()}/api/jobs/download-cover?job_id={jid}&sig={sig2}"
                 return self._html(
-                    f"<h1>Generated</h1><p>Resume and cover letter are ready -- "
-                    f"<a href=\"/jobs/\">open the app</a> to download them.</p>")
-            # Log the real reason regardless of whether the client is still connected --
-            # found live: a slow generate (large JD, several retries) outlasted the
-            # browser's own patience, so by the time this tried to WRITE the error back,
-            # the client had already disconnected (BrokenPipeError), and the actual
-            # reason was never visible anywhere except inside that unsent HTML body.
-            print(f"[jobs] generate-link failed for job {jid}: {err}", file=sys.stderr)
-            return self._html(f"<h1>Generation failed</h1><p>{err}</p>", 500)
+                    f"<h1>Already generated</h1><p>{title} hasn't been rescored since its last "
+                    f"generation, so nothing changed -- here are the existing files: "
+                    f"<a href=\"{resume_url}\">resume</a> | <a href=\"{cover_url}\">cover letter</a>.</p>")
+            if state == "already_running":
+                return self._html(
+                    f"<h1>Already in progress</h1><p>{title} is already generating -- "
+                    f"you'll get a Telegram message with the files once it's done.</p>")
+            if state == "no_such_job":
+                return self._html("<h1>No such job</h1>", 404)
+            return self._html(
+                f"<h1>Generating&hellip;</h1><p>Started for {title}. You'll get a Telegram "
+                f"message with resume + cover letter download links once it's done "
+                f"(usually a couple of minutes) -- safe to close this tab now.</p>")
+
+        if p == "/api/jobs/download-resume" or p == "/api/jobs/download-cover":
+            try:
+                jid = int(qs.get("job_id", ["0"])[0])
+            except ValueError:
+                jid = 0
+            sig = qs.get("sig", [""])[0]
+            filename = "resume.pdf" if p == "/api/jobs/download-resume" else "cover_letter.pdf"
+            return self._serve_signed_job_file(jid, sig, filename)
 
         if p == "/api/jobs/view-details":
             # The "View JD" button in the Telegram notification -- kept the

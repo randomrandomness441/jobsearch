@@ -78,6 +78,50 @@ def send_job_alert(job, generate_url, view_url):
     return True, None
 
 
+def send_generation_complete(job, resume_url, cover_url):
+    """Follow-up message once an async "Generate now" click actually finishes
+    -- the real fix for a generate that used to hang the original click for
+    1-3+ minutes. Both URLs are HMAC-signed single-file download links (see
+    server.py's _serve_signed_job_file), not a login-gated app page, so they
+    open directly for whoever's on the other end of this chat."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False, "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set"
+    text = f"*Generated*: {job['title']} @ {job['company']}"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown",
+        "reply_markup": {
+            "inline_keyboard": [
+                [{"text": "Download resume", "url": resume_url},
+                 {"text": "Download cover letter", "url": cover_url}],
+            ]
+        },
+    }
+    result, err = _call("sendMessage", payload)
+    if err:
+        return False, err
+    if not result.get("ok"):
+        return False, f"Telegram rejected the message: {result}"
+    return True, None
+
+
+def send_generation_failed(job, reason):
+    """The other half of send_generation_complete -- an async generate can
+    fail same as a synchronous one always could, and that needs to actually
+    reach the person who clicked, not just sit in server logs nobody's
+    watching in the moment."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False, "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set"
+    text = f"*Generation failed*: {job['title']} @ {job['company']}\n\n{(reason or '')[:300]}"
+    result, err = _call("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
+    if err:
+        return False, err
+    if not result.get("ok"):
+        return False, f"Telegram rejected the message: {result}"
+    return True, None
+
+
 def _print_chat_id():
     """Run once, by hand, after messaging your bot -- prints the chat id
     to put in TELEGRAM_CHAT_ID. Not called by poll_and_notify.py."""
