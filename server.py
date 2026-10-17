@@ -919,7 +919,14 @@ def _zai_select_content(job, profile, point_bank_items, skill_names, candidate_y
         "one, and a pass on either one alone is NOT enough to skip rewording:\n"
         "   CHECK A (JD vocabulary): does the JD name a specific tool, technique, or concept that this "
         "item genuinely, truthfully demonstrates but describes in different words? If yes, reword to "
-        "use the JD's term.\n"
+        "use the JD's term. This also covers the JD's own REPEATED framing/theme words, not just named "
+        "tools -- if the JD's title or opening paragraph centers on a word like \"distributed systems\", "
+        "\"real-time\", or \"high-throughput\" and an item's real, true work genuinely fits that framing "
+        "(e.g. a large multi-pipeline data platform really is a distributed system, even if the point-"
+        "bank text never used that exact word), use the JD's own word for it. Checked live: a real "
+        "generate for a posting titled \"Distributed Systems\" that used the word four times never used "
+        "it once anywhere in the resume or cover letter, despite the underlying work genuinely "
+        "qualifying -- that's a missed match, not appropriate restraint.\n"
         "   CHECK B (plain language -- the one that gets skipped if you're not deliberate about it): "
         "read the item's ORIGINAL point-bank wording as if you'd never seen the system before. Would "
         "someone outside this exact specialty follow what was done and why it mattered on one read? "
@@ -1167,8 +1174,18 @@ def _zai_generate_and_score(job, profile, point_bank_items, skill_names, candida
     kapitsa_rows = [p for p in point_bank_items
                     if p["entry_type"] == "project" and p["company"] == "Kapitsa"]
     fallback_project_ids = {max(kapitsa_rows, key=lambda r: r["id"])["id"]} if kapitsa_rows else set()
+    # If the caller didn't explicitly force a project (the normal "just click Generate"
+    # path -- no one clicked "Add project to resume"), but Call 1 genuinely judged Kapitsa
+    # worth including for THIS JD, promote that into the forced set so it actually survives
+    # the one-page trim. Found live, repeatedly: the default path kept producing resumes
+    # with zero Projects section even when Call 1 had approved Kapitsa, because merely
+    # "advisory" inclusion is NOT trim-protected -- a prior version of this code deliberately
+    # left it that way, reasoning an approval shouldn't out-rank role bullets by default, but
+    # the standing instruction here is "add Kapitsa whenever it's genuinely relevant," not
+    # "only if the user remembers to force it in."
+    effective_forced_ids = set(forced_project_ids or ()) or set(advisory_project_ids)
     selected = _zai_select_content(job, profile, point_bank_items, skill_names, candidate_years,
-                                    scored["requirements"], forced_project_ids=forced_project_ids,
+                                    scored["requirements"], forced_project_ids=effective_forced_ids,
                                     advisory_project_ids=advisory_project_ids | fallback_project_ids,
                                     tuning_key=tuning_key)
     if selected is None:
@@ -1183,8 +1200,7 @@ def _zai_generate_and_score(job, profile, point_bank_items, skill_names, candida
     # row was actually forced (an explicit user insistence beats the model's own pick).
     project_items = [it for it in priority_items if it["kind"] == "project"]
     if len(project_items) > 1:
-        forced_set = set(forced_project_ids or [])
-        keep = next((it for it in project_items if it["row_id"] in forced_set), project_items[0])
+        keep = next((it for it in project_items if it["row_id"] in effective_forced_ids), project_items[0])
         priority_items = [it for it in priority_items if it["kind"] != "project"] + [keep]
     # Offering a candidate to Call 2 only works if the model actually bothers to emit it --
     # it's told "you are not judging whether to include it, only how to word it" for every
@@ -1212,11 +1228,10 @@ def _zai_generate_and_score(job, profile, point_bank_items, skill_names, candida
         "missing": scored["missing"],
         "score": scored["score"],
         "reason": scored["reason"],
-        # Carried through so generate.py's page-trim never silently drops
-        # a project the user explicitly forced on via "Add to resume" --
-        # Call 2 only decides whether a forced item is included, not where
-        # it ranks, so without this it could still get cut as low-priority.
-        "forced_project_ids": list(forced_project_ids or []),
+        # Carried through so generate.py's page-trim never silently drops a project the
+        # user explicitly forced on via "Add to resume" -- OR one Call 1 itself judged
+        # genuinely worth including, now promoted into this same set above.
+        "forced_project_ids": list(effective_forced_ids),
         # Genuine Call-1 approvals only (never the fallback-filler ids) --
         # generate.py uses this to decide which project, if any, earns the
         # "survive the one-page trim" floor. A fallback filler never does;
@@ -1266,7 +1281,11 @@ def _zai_draft_application(job, profile, points_text, skill_names, candidate_yea
         "if the posting wants something the point bank doesn't cover, don't claim it, just "
         "don't mention it. Be specific: reference real numbers and real systems from the "
         "point bank, and real specifics from the posting (the team, the problem, a named "
-        "technology) -- not generic enthusiasm.\n\n"
+        "technology) -- not generic enthusiasm. If the posting's own title or opening "
+        "paragraph repeats a theme word (e.g. \"distributed systems\", \"real-time\", "
+        "\"high-throughput\") and the candidate's real work genuinely fits that framing, use "
+        "the posting's own word for it -- don't describe the same true work in different "
+        "language just because the point bank happened to phrase it differently.\n\n"
         + HUMAN_STYLE_RULES +
         "\nResume summary: exactly 2 sentences, no greeting, same shape every time so it reads "
         "as one consistent, deliberate statement rather than a different structure each run:\n"
