@@ -613,17 +613,30 @@ def jobs_clear_llm_scores(date_cutoff=None):
     alone. date_cutoff (optional, a fetched_ts): only clears postings
     fetched at or after it, so clearing doesn't also make a posting from
     months back newly eligible for a real LLM spend on the next judge pass.
+
+    Also clears notified_ts -- found live: clearing a score and re-judging
+    it via the AI-judge button never re-notified, even when the fresh
+    score crossed the threshold again, because notified_ts was never
+    touched here. A "start over" action on a job's score should mean a
+    genuinely fresh notification is possible too, not just a fresh number
+    nobody ever hears about -- the AI-judge button itself never sends
+    notifications (only poll_and_notify's own cron tick does), so this is
+    the one place that needs to put the job back in "eligible to notify"
+    state for that next tick to actually pick it up.
+
     Returns how many rows were actually cleared."""
     con = connect()
     if date_cutoff is not None:
         cur = con.execute(
-            "UPDATE jobs SET llm_score=NULL, llm_reason='', llm_judged_ts=NULL, llm_missing='[]', llm_projects='[]' "
+            "UPDATE jobs SET llm_score=NULL, llm_reason='', llm_judged_ts=NULL, llm_missing='[]', "
+            "llm_projects='[]', llm_requirements='[]', notified_ts=NULL "
             "WHERE llm_score IS NOT NULL AND fetched_ts >= ?",
             (date_cutoff,),
         )
     else:
         cur = con.execute(
-            "UPDATE jobs SET llm_score=NULL, llm_reason='', llm_judged_ts=NULL, llm_missing='[]', llm_projects='[]' "
+            "UPDATE jobs SET llm_score=NULL, llm_reason='', llm_judged_ts=NULL, llm_missing='[]', "
+            "llm_projects='[]', llm_requirements='[]', notified_ts=NULL "
             "WHERE llm_score IS NOT NULL"
         )
     con.commit()
