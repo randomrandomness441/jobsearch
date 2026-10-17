@@ -33,6 +33,13 @@ import ats as jobs_ats  # noqa: E402
 import notify_telegram  # noqa: E402
 
 NOTIFY_THRESHOLD = 80
+# Only postings fetched this recently are eligible for a Telegram alert at all --
+# same 14-day window score_eligible() already uses for "recent enough to care about".
+# Found live: clearing scores on a backlog of 77 old, long-tracked postings and
+# re-judging them crossed the threshold on all of them at once, firing a 77-message
+# Telegram burst for jobs that were never actually new -- a genuinely fresh posting
+# should notify, a months-old one that just got rescored shouldn't.
+NOTIFY_RECENT_DAYS = 14
 LOCK_PATH = os.path.join(ROOT, "data", "poll.lock")
 # Overridable so a local/manual run can point at a different base URL than
 # the real deployed one; the real deploy sets this to the actual public
@@ -90,23 +97,35 @@ def score_eligible():
 
 
 def notify_crossed_threshold():
-    sent, cleared = 0, 0
+    sent, cleared, skipped_old = 0, 0, 0
+    date_cutoff = S._days_cutoff(None, default=NOTIFY_RECENT_DAYS)
     for j in jobsdb.jobs_list():
         if j["llm_score"] is None:
             continue
         already_notified = j["notified_ts"] is not None
+        is_recent = date_cutoff is None or j["fetched_ts"] >= date_cutoff
         if j["llm_score"] >= NOTIFY_THRESHOLD:
-            if not already_notified:
-                sig = S._sign_job_id(j["id"])
-                generate_url = f"{BASE_URL}/api/jobs/generate-link?job_id={j['id']}&sig={sig}"
-                view_url = f"{BASE_URL}/api/jobs/view-details?job_id={j['id']}&sig={sig}"
-                ok, err = notify_telegram.send_job_alert(j, generate_url, view_url)
-                if ok:
-                    jobsdb.jobs_mark_notified(j["id"])
-                    sent += 1
-                    print(f"[poll] notified: {j['title']} @ {j['company']} (score {j['llm_score']:.0f})")
-                else:
-                    print(f"[poll] notify FAILED for job {j['id']}: {err}", file=sys.stderr)
+            if already_notified:
+                continue
+            if not is_recent:
+                # Crossed the threshold (a rescore, not a fresh fetch) but this posting
+                # is old -- don't fire a Telegram alert for it, but don't leave it stuck
+                # re-checking forever either: a later genuine re-fetch of the same URL
+                # would just update this same row, not reset notified_ts, so this is the
+                # one place that needs to decide "not notify-worthy" is itself a final
+                # answer here, not a pending one.
+                skipped_old += 1
+                continue
+            sig = S._sign_job_id(j["id"])
+            generate_url = f"{BASE_URL}/api/jobs/generate-link?job_id={j['id']}&sig={sig}"
+            view_url = f"{BASE_URL}/api/jobs/view-details?job_id={j['id']}&sig={sig}"
+            ok, err = notify_telegram.send_job_alert(j, generate_url, view_url)
+            if ok:
+                jobsdb.jobs_mark_notified(j["id"])
+                sent += 1
+                print(f"[poll] notified: {j['title']} @ {j['company']} (score {j['llm_score']:.0f})")
+            else:
+                print(f"[poll] notify FAILED for job {j['id']}: {err}", file=sys.stderr)
         elif already_notified:
             # Score dropped back below threshold (master doc or JD
             # changed) -- clear the flag so a genuine re-crossing later
@@ -115,7 +134,8 @@ def notify_crossed_threshold():
             jobsdb.jobs_clear_notified(j["id"])
             cleared += 1
     print(f"[poll] {sent} notification(s) sent, {cleared} notified-flag(s) cleared "
-          f"(score dropped back below {NOTIFY_THRESHOLD})")
+          f"(score dropped back below {NOTIFY_THRESHOLD}), {skipped_old} skipped "
+          f"(qualified but older than {NOTIFY_RECENT_DAYS}d)")
 
 
 def main():

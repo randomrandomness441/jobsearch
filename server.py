@@ -1663,14 +1663,40 @@ def _generate_one(job_id, summary, cover_letter_body, selection):
     return True, None
 
 
+def _needs_regenerate(job):
+    """True only if this job has never been generated, or has been
+    rescored (master-doc edit, or an explicit "Clear scores") since its
+    last generation. Repeat clicks on the same "Generate now" link --
+    e.g. clicking it again from the same Telegram message -- otherwise
+    burned a full score+select+draft+render pass (three real LLM calls)
+    and silently overwrote the exact same files every single time, found
+    live as a real concern: nothing stopped a job from being regenerated
+    an unbounded number of times for zero actual change."""
+    draft = jobsdb.applications_find_draft(job["id"])
+    if draft is None:
+        return True
+    # No real judged_ts at all (score was explicitly cleared, or never judged) means
+    # there's nothing valid to compare against -- must regenerate. Caught live: the
+    # naive `(job["llm_judged_ts"] or 0) > draft["generated_ts"]` silently defaulted
+    # None to 0, and 0 is never greater than a real past timestamp, so a job whose
+    # score had JUST been cleared still read as "nothing changed, skip it."
+    if job["llm_judged_ts"] is None:
+        return True
+    return job["llm_judged_ts"] > draft["generated_ts"]
+
+
 def _generate_single_job(jid):
     """The same score->select->draft->render pipeline _run_generate_batch
     runs per job in a batch, but for exactly one job, synchronous, no
     forced project -- what the poll script's emailed "Generate now" link
-    triggers. Returns (ok, error_or_None)."""
+    triggers. Returns (ok, error_or_None). A no-op success (True, None) if
+    the job is already generated and hasn't been rescored since -- see
+    _needs_regenerate."""
     job = jobsdb.jobs_get(jid)
     if not job:
         return False, "no such job"
+    if not _needs_regenerate(job):
+        return True, None
     profile, skill_names, _bullets_text, _skills_line, candidate_years = _jobs_resume_body()
     point_bank_items = jobsdb.point_bank_all()
     selection = _zai_generate_and_score(job, profile, point_bank_items, skill_names,
