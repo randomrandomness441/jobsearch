@@ -23,6 +23,7 @@ import fcntl
 import os
 import subprocess
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
@@ -33,13 +34,6 @@ import ats as jobs_ats  # noqa: E402
 import notify_telegram  # noqa: E402
 
 NOTIFY_THRESHOLD = 80
-# Only postings fetched this recently are eligible for a Telegram alert at all --
-# same 14-day window score_eligible() already uses for "recent enough to care about".
-# Found live: clearing scores on a backlog of 77 old, long-tracked postings and
-# re-judging them crossed the threshold on all of them at once, firing a 77-message
-# Telegram burst for jobs that were never actually new -- a genuinely fresh posting
-# should notify, a months-old one that just got rescored shouldn't.
-NOTIFY_RECENT_DAYS = 14
 LOCK_PATH = os.path.join(ROOT, "data", "poll.lock")
 # Overridable so a local/manual run can point at a different base URL than
 # the real deployed one; the real deploy sets this to the actual public
@@ -96,24 +90,37 @@ def score_eligible():
     print(f"[poll] scored {len(candidates) - failed}/{len(candidates)}")
 
 
-def notify_crossed_threshold():
+def notify_crossed_threshold(run_started_ts):
+    """Only a posting genuinely fetched in THIS cron tick (fetched_ts >=
+    run_started_ts, captured before fetch_new_postings() ran) is eligible
+    for a Telegram alert at all -- not "recently", THIS run, full stop.
+    jobs_add() only sets fetched_ts once, at insert, and never touches it
+    for an already-tracked duplicate (confirmed in db.py), so this is an
+    exact signal, not a time-window approximation.
+
+    Real incident this replaces a looser "last 14 days" version of:
+    clearing scores on a 77-job backlog and re-judging it crossed the
+    threshold on all of them at once, firing a 77-message Telegram burst
+    for postings that were never actually new. A rescore of ANYTHING
+    already in the database -- a minute old or a year old -- must never
+    be able to trigger a notification on its own; only a genuine new
+    fetch can.
+    """
     sent, cleared, skipped_old = 0, 0, 0
-    date_cutoff = S._days_cutoff(None, default=NOTIFY_RECENT_DAYS)
     for j in jobsdb.jobs_list():
         if j["llm_score"] is None:
             continue
         already_notified = j["notified_ts"] is not None
-        is_recent = date_cutoff is None or j["fetched_ts"] >= date_cutoff
+        is_from_this_run = j["fetched_ts"] >= run_started_ts
         if j["llm_score"] >= NOTIFY_THRESHOLD:
             if already_notified:
                 continue
-            if not is_recent:
-                # Crossed the threshold (a rescore, not a fresh fetch) but this posting
-                # is old -- don't fire a Telegram alert for it, but don't leave it stuck
-                # re-checking forever either: a later genuine re-fetch of the same URL
-                # would just update this same row, not reset notified_ts, so this is the
-                # one place that needs to decide "not notify-worthy" is itself a final
-                # answer here, not a pending one.
+            if not is_from_this_run:
+                # Crossed the threshold via a rescore, not a fresh fetch -- don't
+                # alert. Not marked notified either, so it stays visible/available
+                # in the UI; a LATER genuine re-fetch of this exact posting would
+                # just update this same row (same dedup key), never reset
+                # notified_ts anyway, so there's nothing to "come back to" here.
                 skipped_old += 1
                 continue
             sig = S._sign_job_id(j["id"])
@@ -135,7 +142,7 @@ def notify_crossed_threshold():
             cleared += 1
     print(f"[poll] {sent} notification(s) sent, {cleared} notified-flag(s) cleared "
           f"(score dropped back below {NOTIFY_THRESHOLD}), {skipped_old} skipped "
-          f"(qualified but older than {NOTIFY_RECENT_DAYS}d)")
+          f"(qualified but not fetched in this run)")
 
 
 def main():
@@ -144,9 +151,10 @@ def main():
         print("[poll] another run is already in progress -- skipping this tick")
         return
     try:
+        run_started_ts = time.time()   # captured BEFORE fetch -- see notify_crossed_threshold's docstring
         fetch_new_postings()
         score_eligible()
-        notify_crossed_threshold()
+        notify_crossed_threshold(run_started_ts)
     finally:
         lock.close()
 
