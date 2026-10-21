@@ -25,6 +25,7 @@ from datetime import datetime
 from docx import Document
 from docx.shared import Pt, Inches
 from docx.enum.text import WD_TAB_ALIGNMENT
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
@@ -67,6 +68,30 @@ def _set_margins(doc):
     s = doc.sections[0]
     s.top_margin = s.bottom_margin = MARGIN_TOP_BOTTOM
     s.left_margin = s.right_margin = MARGIN_LEFT_RIGHT
+
+
+def _url_for(value):
+    return value if value.startswith("http") else f"https://{value}"
+
+
+def _add_hyperlink(paragraph, text, url):
+    """A REAL clickable link (opens the browser on click/tap), not just text
+    that reads like a URL -- python-docx has no high-level API for this, so
+    it's built at the raw OOXML level. Deliberately an EMPTY w:rPr: no color,
+    no underline added -- the run inherits the paragraph's normal formatting,
+    so it looks identical to the plain text around it (asked for by name:
+    clickable, but don't change how it looks)."""
+    part = paragraph.part
+    r_id = part.relate_to(url, RT.HYPERLINK, is_external=True)
+    hyperlink = OxmlElement("w:hyperlink")
+    hyperlink.set(qn("r:id"), r_id)
+    run_el = OxmlElement("w:r")
+    run_el.append(OxmlElement("w:rPr"))
+    t = OxmlElement("w:t")
+    t.text = text
+    run_el.append(t)
+    hyperlink.append(run_el)
+    paragraph._p.append(hyperlink)
 
 
 def _bottom_border(paragraph, size=4, color="999999"):
@@ -124,11 +149,15 @@ def render(profile, title, summary, roles, skills_by_category, out_path, project
     title_p = doc.add_paragraph(title)
     _tighten(title_p, space_after=2)
 
-    contact_parts = [profile['phone'], profile['email'], profile['linkedin'], profile['github']]
-    if profile.get('portfolio'):   # .get -- older profiles saved before this field existed still render fine
-        contact_parts.append(profile['portfolio'])
     contact = doc.add_paragraph()
-    contact.add_run(" | ".join(contact_parts))
+    # LinkedIn and the portfolio site are real clickable links (open directly, no
+    # copy-pasting the URL) -- phone/email/github stay plain text, same as before.
+    contact.add_run(f"{profile['phone']} | {profile['email']} | ")
+    _add_hyperlink(contact, profile['linkedin'], _url_for(profile['linkedin']))
+    contact.add_run(f" | {profile['github']}")
+    if profile.get('portfolio'):   # .get -- older profiles saved before this field existed still render fine
+        contact.add_run(" | ")
+        _add_hyperlink(contact, profile['portfolio'], _url_for(profile['portfolio']))
     _tighten(contact, space_after=2)
 
     _heading(doc, "SUMMARY")
