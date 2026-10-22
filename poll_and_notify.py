@@ -33,7 +33,6 @@ import db as jobsdb  # noqa: E402
 import ats as jobs_ats  # noqa: E402
 import notify_telegram  # noqa: E402
 
-NOTIFY_THRESHOLD = 80
 LOCK_PATH = os.path.join(ROOT, "data", "poll.lock")
 # Overridable so a local/manual run can point at a different base URL than
 # the real deployed one; the real deploy sets this to the actual public
@@ -97,59 +96,51 @@ def score_eligible():
     print(f"[poll] scored {len(candidates) - failed}/{len(candidates)}")
 
 
-def notify_crossed_threshold(run_started_ts):
-    """Only a posting genuinely fetched in THIS cron tick (fetched_ts >=
-    run_started_ts, captured before fetch_new_postings() ran) is eligible
-    for a Telegram alert at all -- not "recently", THIS run, full stop.
-    jobs_add() only sets fetched_ts once, at insert, and never touches it
-    for an already-tracked duplicate (confirmed in db.py), so this is an
-    exact signal, not a time-window approximation.
+def notify_new_postings(run_started_ts):
+    """Notify for EVERY scored posting fetched in THIS cron tick -- no score
+    threshold anymore (was NOTIFY_THRESHOLD = 80; removed on request: every
+    posting should produce a notification now, not just ones scoring 80+).
 
-    Real incident this replaces a looser "last 14 days" version of:
-    clearing scores on a 77-job backlog and re-judging it crossed the
-    threshold on all of them at once, firing a 77-message Telegram burst
-    for postings that were never actually new. A rescore of ANYTHING
-    already in the database -- a minute old or a year old -- must never
-    be able to trigger a notification on its own; only a genuine new
-    fetch can.
+    Still gated on "genuinely fetched in this run" (fetched_ts >=
+    run_started_ts, captured before fetch_new_postings() ran), not just
+    "recently" -- jobs_add() only ever sets fetched_ts once, at insert, and
+    never touches it for an already-tracked duplicate (confirmed in db.py),
+    so this is an exact signal, not a time-window approximation. Without
+    this, a rescore of anything already in the database (a manual AI-judge
+    run, a master-doc edit, an explicit "Clear scores") would notify again
+    too -- real incident: clearing scores on a 77-job backlog and
+    re-judging it fired a 77-message Telegram burst for postings that were
+    never actually new. That risk is UNCHANGED by removing the score
+    threshold, so this gate stays.
+
+    Still gated on "not already notified" -- same dedup as before, a
+    posting only ever gets one notification per genuine fetch.
     """
-    sent, cleared, skipped_old = 0, 0, 0
+    sent, skipped_old = 0, 0
     for j in jobsdb.jobs_list():
         if j["llm_score"] is None:
             continue
-        already_notified = j["notified_ts"] is not None
-        is_from_this_run = j["fetched_ts"] >= run_started_ts
-        if j["llm_score"] >= NOTIFY_THRESHOLD:
-            if already_notified:
-                continue
-            if not is_from_this_run:
-                # Crossed the threshold via a rescore, not a fresh fetch -- don't
-                # alert. Not marked notified either, so it stays visible/available
-                # in the UI; a LATER genuine re-fetch of this exact posting would
-                # just update this same row (same dedup key), never reset
-                # notified_ts anyway, so there's nothing to "come back to" here.
-                skipped_old += 1
-                continue
-            sig = S._sign_job_id(j["id"])
-            generate_url = f"{BASE_URL}/api/jobs/generate-link?job_id={j['id']}&sig={sig}"
-            view_url = f"{BASE_URL}/api/jobs/view-details?job_id={j['id']}&sig={sig}"
-            ok, err = notify_telegram.send_job_alert(j, generate_url, view_url)
-            if ok:
-                jobsdb.jobs_mark_notified(j["id"])
-                sent += 1
-                print(f"[poll] notified: {j['title']} @ {j['company']} (score {j['llm_score']:.0f})")
-            else:
-                print(f"[poll] notify FAILED for job {j['id']}: {err}", file=sys.stderr)
-        elif already_notified:
-            # Score dropped back below threshold (master doc or JD
-            # changed) -- clear the flag so a genuine re-crossing later
-            # notifies again instead of being silently swallowed forever
-            # by the first notification.
-            jobsdb.jobs_clear_notified(j["id"])
-            cleared += 1
-    print(f"[poll] {sent} notification(s) sent, {cleared} notified-flag(s) cleared "
-          f"(score dropped back below {NOTIFY_THRESHOLD}), {skipped_old} skipped "
-          f"(qualified but not fetched in this run)")
+        if j["notified_ts"] is not None:
+            continue
+        if j["fetched_ts"] < run_started_ts:
+            # Scored in this tick but fetched earlier (a rescore, not a fresh
+            # fetch) -- don't alert. Not marked notified either, so it's still
+            # eligible once a genuine future re-fetch of this exact posting
+            # updates it.
+            skipped_old += 1
+            continue
+        sig = S._sign_job_id(j["id"])
+        generate_url = f"{BASE_URL}/api/jobs/generate-link?job_id={j['id']}&sig={sig}"
+        view_url = f"{BASE_URL}/api/jobs/view-details?job_id={j['id']}&sig={sig}"
+        ok, err = notify_telegram.send_job_alert(j, generate_url, view_url)
+        if ok:
+            jobsdb.jobs_mark_notified(j["id"])
+            sent += 1
+            print(f"[poll] notified: {j['title']} @ {j['company']} (score {j['llm_score']:.0f})")
+        else:
+            print(f"[poll] notify FAILED for job {j['id']}: {err}", file=sys.stderr)
+    print(f"[poll] {sent} notification(s) sent, {skipped_old} skipped "
+          f"(scored but not fetched in this run)")
 
 
 def main():
@@ -158,10 +149,10 @@ def main():
         print("[poll] another run is already in progress -- skipping this tick")
         return
     try:
-        run_started_ts = time.time()   # captured BEFORE fetch -- see notify_crossed_threshold's docstring
+        run_started_ts = time.time()   # captured BEFORE fetch -- see notify_new_postings's docstring
         fetch_new_postings()
         score_eligible()
-        notify_crossed_threshold(run_started_ts)
+        notify_new_postings(run_started_ts)
     finally:
         lock.close()
 
