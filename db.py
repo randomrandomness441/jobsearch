@@ -502,7 +502,15 @@ def jobs_query(status=None, eng_only=True, level_tiers=None, min_score=None, q_t
         unfiltered_params.append(status)
     total_unfiltered = con.execute(unfiltered_q, unfiltered_params).fetchone()[0]
 
-    where, params = ["IS_TARGET_LOCATION(location, description_raw) = 1"], []
+    # Manual jobs bypass the India-only location filter -- found live: a job added
+    # by hand via manage.py/the "Add job manually" dialog with no India location
+    # (and no India mention in the JD's first 500 chars) was silently invisible in
+    # the UI, even with the "Manual only" source filter selected, because this
+    # location check is unconditional. The filter exists to de-clutter the
+    # AUTOMATED feed (it discards ~11k US/EU postings per cron fetch); a job the
+    # user deliberately added by hand is wanted by definition and should always
+    # show up.
+    where, params = ["(source = 'manual' OR IS_TARGET_LOCATION(location, description_raw) = 1)"], []
     if status:
         where.append("status=?")
         params.append(status)
