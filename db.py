@@ -114,6 +114,18 @@ CREATE TABLE IF NOT EXISTS gap_clusters (
     id   INTEGER PRIMARY KEY CHECK (id = 1),
     data TEXT NOT NULL
 );
+
+-- One Telegram bot/chat per user, keyed by their login email -- the
+-- PRIMARY KEY is what makes "only one row per user" a DB-level guarantee
+-- rather than an app-level convention; telegram_config_set() upserts
+-- against it so adding again when one already exists replaces it instead
+-- of erroring or creating a second row.
+CREATE TABLE IF NOT EXISTS telegram_config (
+    user_email TEXT PRIMARY KEY,
+    bot_token  TEXT NOT NULL,
+    chat_id    TEXT NOT NULL,
+    updated_ts REAL NOT NULL
+);
 """
 
 
@@ -382,6 +394,29 @@ def profile_all():
     rows = con.execute("SELECT key, value FROM profile").fetchall()
     con.close()
     return {r["key"]: r["value"] for r in rows if r["key"] != _PROFILE_VERSION_KEY}
+
+
+# ── telegram_config (one bot/chat per user, keyed by login email) ───────
+def telegram_config_get(user_email):
+    con = connect()
+    row = con.execute("SELECT * FROM telegram_config WHERE user_email=?", (user_email,)).fetchone()
+    con.close()
+    return dict(row) if row else None
+
+
+def telegram_config_set(user_email, bot_token, chat_id):
+    """Upsert -- a second call for the same user replaces their existing
+    row rather than erroring or adding a second one (user_email is the
+    PRIMARY KEY, so there can only ever be one)."""
+    con = connect()
+    con.execute(
+        "INSERT INTO telegram_config (user_email, bot_token, chat_id, updated_ts) VALUES (?,?,?,?) "
+        "ON CONFLICT(user_email) DO UPDATE SET bot_token=excluded.bot_token, "
+        "chat_id=excluded.chat_id, updated_ts=excluded.updated_ts",
+        (user_email, bot_token, chat_id, time.time()),
+    )
+    con.commit()
+    con.close()
 
 
 # ── jobs ────────────────────────────────────────────────────────────────

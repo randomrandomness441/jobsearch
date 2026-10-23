@@ -2296,6 +2296,16 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/profile/fields":
             return self._json({"profile": jobsdb.profile_all()})
 
+        if p == "/api/telegram/config":
+            # Never echoes the real bot_token back to the browser once saved --
+            # only enough to confirm it's set (last 4 chars) and offer "Replace".
+            email = _valid_session_email(self.headers.get("Cookie", ""))
+            cfg = jobsdb.telegram_config_get(email)
+            if not cfg:
+                return self._json({"configured": False})
+            return self._json({"configured": True, "chat_id": cfg["chat_id"],
+                                "bot_token_last4": cfg["bot_token"][-4:]})
+
         if p == "/":
             self.send_response(302)
             self.send_header("Location", "/jobs/")
@@ -2674,6 +2684,30 @@ class Handler(BaseHTTPRequestHandler):
 
         if p.startswith("/api/jobs/") or p.startswith("/api/applications/") or p.startswith("/api/profile/"):
             return self._jobs_post(p, b)
+
+        if p.startswith("/api/telegram/"):
+            return self._telegram_post(p, b)
+
+        self.send_error(404)
+
+    def _telegram_post(self, p, b):
+        email = _valid_session_email(self.headers.get("Cookie", ""))
+
+        if p == "/api/telegram/config":
+            bot_token, chat_id = b.get("bot_token", "").strip(), b.get("chat_id", "").strip()
+            if not bot_token or not chat_id:
+                return self._json({"error": "bot token and chat id are both required"}, 400)
+            jobsdb.telegram_config_set(email, bot_token, chat_id)
+            return self._json({"ok": True})
+
+        if p == "/api/telegram/test":
+            cfg = jobsdb.telegram_config_get(email)
+            if not cfg:
+                return self._json({"error": "no Telegram config saved yet"}, 400)
+            ok, err = notify_telegram.send_test_message(cfg["bot_token"], cfg["chat_id"])
+            if not ok:
+                return self._json({"error": err}, 400)
+            return self._json({"ok": True})
 
         self.send_error(404)
 

@@ -23,8 +23,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 _API = "https://api.telegram.org/bot{token}/{method}"
 
 
-def _call(method, payload):
-    url = _API.format(token=TELEGRAM_BOT_TOKEN, method=method)
+def _call(method, payload, bot_token=None):
+    url = _API.format(token=bot_token or TELEGRAM_BOT_TOKEN, method=method)
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(), method="POST",
         headers={"content-type": "application/json"})
@@ -115,6 +115,25 @@ def send_generation_failed(job, reason):
         return False, "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set"
     text = f"*Generation failed*: {job['title']} @ {job['company']}\n\n{(reason or '')[:300]}"
     result, err = _call("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
+    if err:
+        return False, err
+    if not result.get("ok"):
+        return False, f"Telegram rejected the message: {result}"
+    return True, None
+
+
+def send_test_message(bot_token, chat_id):
+    """For the Profile tab's "Send test message" button -- proves a
+    user's own saved bot_token/chat_id actually work, independent of the
+    env-var admin bot the other send_* functions here use. Returns
+    (ok, error_or_None), same convention as the rest of this file."""
+    if not bot_token or not chat_id:
+        return False, "bot token and chat id are both required"
+    result, err = _call(
+        "sendMessage",
+        {"chat_id": chat_id, "text": "Test message from jobsearch -- your Telegram setup works."},
+        bot_token=bot_token,
+    )
     if err:
         return False, err
     if not result.get("ok"):

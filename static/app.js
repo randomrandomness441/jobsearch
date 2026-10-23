@@ -593,6 +593,7 @@ function showView(name) {
     document.getElementById('pf-proposal').innerHTML = '';
     document.getElementById('pf-upload-status').textContent = '';
     document.getElementById('pf-upload').value = '';
+    loadTelegramConfig();
   }
 }
 
@@ -1297,5 +1298,58 @@ document.addEventListener('click', (e) => {
   const more = document.getElementById('more-actions');
   if (more.open && !more.contains(e.target)) more.open = false;
 });
+
+// ── Telegram notifications: one bot/chat per user ───────────────────────
+async function loadTelegramConfig() {
+  const status = document.getElementById('pf-telegram-status');
+  const saveBtn = document.getElementById('pf-tg-save');
+  document.getElementById('pf-tg-result').textContent = '';
+  const cfg = await api('/api/telegram/config');
+  if (cfg.configured) {
+    status.textContent = `Connected -- bot token ending …${cfg.bot_token_last4}, chat id ${cfg.chat_id}`;
+    saveBtn.textContent = 'Replace';
+  } else {
+    status.textContent = 'Not set up yet -- message your bot once on Telegram, then add its token and your chat id here.';
+    saveBtn.textContent = 'Save';
+  }
+  document.getElementById('pf-tg-token').value = '';
+  document.getElementById('pf-tg-chatid').value = '';
+}
+
+document.getElementById('pf-tg-save').onclick = async () => {
+  const bot_token = document.getElementById('pf-tg-token').value.trim();
+  const chat_id = document.getElementById('pf-tg-chatid').value.trim();
+  const result = document.getElementById('pf-tg-result');
+  if (!bot_token || !chat_id) {
+    result.textContent = 'Bot token and chat id are both required.';
+    return;
+  }
+  const btn = document.getElementById('pf-tg-save');
+  btn.disabled = true;
+  try {
+    await post('/api/telegram/config', {bot_token, chat_id});
+    result.textContent = 'Saved.';
+    await loadTelegramConfig();
+  } catch (e) {
+    result.textContent = 'Error: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+document.getElementById('pf-tg-test').onclick = async () => {
+  const result = document.getElementById('pf-tg-result');
+  const btn = document.getElementById('pf-tg-test');
+  btn.disabled = true;
+  result.textContent = 'Sending…';
+  try {
+    await post('/api/telegram/test', {});
+    result.textContent = 'Test message sent -- check Telegram.';
+  } catch (e) {
+    result.textContent = 'Error: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+};
 
 loadJobs();
