@@ -42,7 +42,10 @@ html,body{margin:0;height:100%}
 .h3-manage{font-size:13px;margin-top:16px}
 .h3-spaced{margin-top:20px}
 .help-text{margin:8px 0 16px}
+.row{display:flex;align-items:center;flex-wrap:wrap}
 .row-start{justify-content:flex-start;gap:8px}
+#guest-banner{background:var(--warn-bg);color:var(--warn);padding:10px 20px;font-size:13.5px;
+  text-align:center;border-bottom:1px solid var(--border)}
 .inline-check{display:inline-flex;align-items:center;gap:6px;margin-bottom:10px}
 /* Type scale bumped up across the board -- base body text was 14px, most
    secondary text (badges, meta lines, labels) was 11-12.5px, well under the

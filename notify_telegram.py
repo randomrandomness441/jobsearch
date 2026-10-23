@@ -37,17 +37,22 @@ def _call(method, payload, bot_token=None):
         return None, str(e)
 
 
-def send_job_alert(job, generate_url, view_url):
+def send_job_alert(job, generate_url, view_url, bot_token=None, chat_id=None):
     """job: a real jobsdb row (needs title, company, url, llm_score).
-    generate_url/view_url: the two signed one-click links. Returns
-    (ok, error_or_None) -- never raises, so one bad send doesn't take the
-    whole poll run down.
+    generate_url/view_url: the two signed one-click links. bot_token/
+    chat_id: this recipient's own Telegram config (see server.py's
+    per-user telegram_config table) -- falls back to the env-var admin
+    bot when omitted, for any caller that hasn't been given a specific
+    user's config. Returns (ok, error_or_None) -- never raises, so one
+    bad send doesn't take the whole poll run down.
 
     Deliberately short: title, company, ATS score, apply link -- the full
     fit-reasoning and job description used to be inlined here and made
     every message huge; that's now one tap away via view_url instead."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False, "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set -- see notify_telegram.py docstring"
+    bot_token = bot_token or TELEGRAM_BOT_TOKEN
+    chat_id = chat_id or TELEGRAM_CHAT_ID
+    if not bot_token or not chat_id:
+        return False, "no Telegram bot_token/chat_id for this recipient"
 
     text = (
         f"*ATS score: {job['llm_score']:.0f}*\n"
@@ -56,10 +61,10 @@ def send_job_alert(job, generate_url, view_url):
     )
     # Two inline buttons -- tap to act, no typing, nothing revealed until
     # you choose to open it. Both URLs ARE the auth (HMAC-signed, see
-    # server.py's _sign_job_id) -- Telegram never sees or needs a
+    # server.py's _sign_job_user) -- Telegram never sees or needs a
     # credential for either.
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": chat_id,
         "text": text,
         "parse_mode": "Markdown",
         "disable_web_page_preview": True,
@@ -70,7 +75,7 @@ def send_job_alert(job, generate_url, view_url):
             ]
         },
     }
-    result, err = _call("sendMessage", payload)
+    result, err = _call("sendMessage", payload, bot_token=bot_token)
     if err:
         return False, err
     if not result.get("ok"):
@@ -78,17 +83,21 @@ def send_job_alert(job, generate_url, view_url):
     return True, None
 
 
-def send_generation_complete(job, resume_url, cover_url):
+def send_generation_complete(job, resume_url, cover_url, bot_token=None, chat_id=None):
     """Follow-up message once an async "Generate now" click actually finishes
     -- the real fix for a generate that used to hang the original click for
     1-3+ minutes. Both URLs are HMAC-signed single-file download links (see
     server.py's _serve_signed_job_file), not a login-gated app page, so they
-    open directly for whoever's on the other end of this chat."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False, "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set"
+    open directly for whoever's on the other end of this chat. bot_token/
+    chat_id: this user's own Telegram config, falling back to the env-var
+    admin bot when omitted."""
+    bot_token = bot_token or TELEGRAM_BOT_TOKEN
+    chat_id = chat_id or TELEGRAM_CHAT_ID
+    if not bot_token or not chat_id:
+        return False, "no Telegram bot_token/chat_id for this recipient"
     text = f"*Generated*: {job['title']} @ {job['company']}"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": chat_id,
         "text": text,
         "parse_mode": "Markdown",
         "reply_markup": {
@@ -98,7 +107,7 @@ def send_generation_complete(job, resume_url, cover_url):
             ]
         },
     }
-    result, err = _call("sendMessage", payload)
+    result, err = _call("sendMessage", payload, bot_token=bot_token)
     if err:
         return False, err
     if not result.get("ok"):
@@ -106,15 +115,18 @@ def send_generation_complete(job, resume_url, cover_url):
     return True, None
 
 
-def send_generation_failed(job, reason):
+def send_generation_failed(job, reason, bot_token=None, chat_id=None):
     """The other half of send_generation_complete -- an async generate can
     fail same as a synchronous one always could, and that needs to actually
     reach the person who clicked, not just sit in server logs nobody's
     watching in the moment."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False, "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set"
+    bot_token = bot_token or TELEGRAM_BOT_TOKEN
+    chat_id = chat_id or TELEGRAM_CHAT_ID
+    if not bot_token or not chat_id:
+        return False, "no Telegram bot_token/chat_id for this recipient"
     text = f"*Generation failed*: {job['title']} @ {job['company']}\n\n{(reason or '')[:300]}"
-    result, err = _call("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
+    result, err = _call("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+                         bot_token=bot_token)
     if err:
         return False, err
     if not result.get("ok"):

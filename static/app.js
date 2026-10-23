@@ -580,12 +580,15 @@ function showView(name) {
   document.getElementById('view-applications').hidden = name !== 'applications';
   document.getElementById('view-profile').hidden = name !== 'profile';
   document.getElementById('view-gaps').hidden = name !== 'gaps';
+  document.getElementById('view-admin').hidden = name !== 'admin';
   document.getElementById('tab-postings').classList.toggle('active', name === 'postings');
   document.getElementById('tab-applications').classList.toggle('active', name === 'applications');
   document.getElementById('tab-profile').classList.toggle('active', name === 'profile');
   document.getElementById('tab-gaps').classList.toggle('active', name === 'gaps');
+  document.getElementById('tab-admin').classList.toggle('active', name === 'admin');
   if (name === 'applications') loadApplications();
   if (name === 'gaps') loadGaps();
+  if (name === 'admin') loadAdminUsers();
   if (name === 'profile') {
     // reset to a clean landing every time you switch in -- upload box +
     // two buttons only, no stale proposal from a previous visit
@@ -600,6 +603,7 @@ function showView(name) {
 document.getElementById('tab-postings').onclick = () => showView('postings');
 document.getElementById('tab-applications').onclick = () => showView('applications');
 document.getElementById('tab-profile').onclick = () => showView('profile');
+document.getElementById('tab-admin').onclick = () => showView('admin');
 document.getElementById('tab-gaps').onclick = () => showView('gaps');
 document.getElementById('btn-manual').onclick = openManual;
 document.getElementById('m-cancel').onclick = closeManual;
@@ -1352,4 +1356,71 @@ document.getElementById('pf-tg-test').onclick = async () => {
   }
 };
 
+// ── session / role: admin, whitelisted, or guest (read-only preview) ───
+// Static action buttons that mutate something -- disabled outright for a
+// guest, so there's nothing to click into a 403 for. The server enforces
+// this independently either way (every mutating route checks role itself),
+// this is just so the UI doesn't invite a guest to try.
+const GUEST_DISABLED_BUTTON_IDS = [
+  'btn-manual', 'btn-refetch', 'btn-llm-backfill', 'btn-clear-llm',
+  'pf-upload-btn', 'pf-paste-btn', 'pf-tg-save', 'pf-tg-test',
+];
+
+async function loadSession() {
+  const session = await api('/api/session');
+  if (session.role === 'guest') {
+    document.getElementById('guest-banner').hidden = false;
+    for (const id of GUEST_DISABLED_BUTTON_IDS) {
+      const el = document.getElementById(id);
+      if (el) el.disabled = true;
+    }
+  }
+  document.getElementById('tab-admin').hidden = session.role !== 'admin';
+  return session;
+}
+
+async function loadAdminUsers() {
+  const result = document.getElementById('admin-result');
+  result.textContent = '';
+  const {users} = await api('/api/admin/users');
+  const list = document.getElementById('admin-users-list');
+  list.innerHTML = users.map(u => `
+    <div class="row row-start" style="margin-bottom:6px">
+      <span style="flex:1">${esc(u.email)} <span class="dim">(${esc(u.role)})</span></span>
+      ${u.role === 'admin' ? '' : `<button class="small admin-remove" data-email="${esc(u.email)}">Remove</button>`}
+    </div>`).join('') || '<p class="dim">No one whitelisted yet.</p>';
+  list.querySelectorAll('.admin-remove').forEach(btn => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        await post('/api/admin/users/remove', {email: btn.dataset.email});
+        await loadAdminUsers();
+      } catch (e) {
+        result.textContent = 'Error: ' + e.message;
+        btn.disabled = false;
+      }
+    };
+  });
+}
+
+document.getElementById('admin-add-btn').onclick = async () => {
+  const input = document.getElementById('admin-new-email');
+  const result = document.getElementById('admin-result');
+  const email = input.value.trim();
+  if (!email) { result.textContent = 'Enter an email first.'; return; }
+  const btn = document.getElementById('admin-add-btn');
+  btn.disabled = true;
+  try {
+    await post('/api/admin/users/add', {email});
+    input.value = '';
+    result.textContent = 'Added.';
+    await loadAdminUsers();
+  } catch (e) {
+    result.textContent = 'Error: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+loadSession();
 loadJobs();

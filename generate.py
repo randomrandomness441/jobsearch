@@ -288,7 +288,7 @@ def _group_into_roles(selected_rows):
     return roles
 
 
-def _group_selected(priority_items):
+def _group_selected(priority_items, user_email):
     """priority_items: [{"row_id", "text", "kind": "role"|"project"}, ...],
     already decided (which items, in what priority order) by the one LLM
     call upstream -- this just looks up the real company/role/dates/name
@@ -302,7 +302,7 @@ def _group_selected(priority_items):
     project leads), each group's own items kept in natural point-bank
     order (id order) so it still reads as a coherent timeline rather than
     a priority-sorted jumble -- same rule _group_into_roles already used."""
-    all_rows_by_id = {r["id"]: r for r in db.point_bank_all(active_only=False)}
+    all_rows_by_id = {r["id"]: r for r in db.point_bank_all(user_email, active_only=False)}
 
     def group(items, key_fn):
         by_key, seen_keys = {}, []
@@ -447,7 +447,7 @@ def _drop_row(roles, projects, row_id):
     return drop_from(roles), drop_from(projects)
 
 
-def generate(job_id, summary, cover_letter_body, selection, out_root="data/applications"):
+def generate(job_id, user_email, summary, cover_letter_body, selection, out_root="data/applications"):
     """selection: the one upstream LLM call's decision (platform/server.py's
     _zai_generate_and_score) -- plain data, never computed here:
     {"priority_items": [{"row_id", "text", "kind": "role"|"project"}, ...]
@@ -456,14 +456,19 @@ def generate(job_id, summary, cover_letter_body, selection, out_root="data/appli
      "requirements": [{"requirement", "importance", "satisfied", "depth",
        "evidence_row_id"}, ...] -- the per-JD-requirement breakdown,
      "missing": [str, ...] -- real content gaps in the master doc for this JD,
-     "score": int, "reason": str}."""
+     "score": int, "reason": str}.
+
+    user_email: whose own point_bank/profile/skills this generate pulls
+    from, and whose own applications row this writes -- the shared job
+    posting (job_id) is the same for everyone, but the resume and cover
+    letter are always built from THIS user's own master doc."""
     violations = humanizer.check_human_style(summary) + humanizer.check_human_style(cover_letter_body)
     if violations:
         raise ValueError("Humanizer check failed, nothing generated:\n- " + "\n- ".join(violations))
 
-    job = db.jobs_get(job_id)
-    profile = db.profile_all()
-    skills = db.skills_all()
+    job = db.jobs_get(user_email, job_id)
+    profile = db.profile_all(user_email)
+    skills = db.skills_all(user_email)
     resume_title = profile["title"]
 
     # A regenerate (new summary/cover letter for a job already drafted but
@@ -480,15 +485,15 @@ def generate(job_id, summary, cover_letter_body, selection, out_root="data/appli
     # along with the old ones, since they shared a path -- caught by
     # actually regenerating the same job twice in one day and watching the
     # output folder vanish, not by reasoning about it.
-    old_draft = db.applications_find_draft(job_id)
+    old_draft = db.applications_find_draft(user_email, job_id)
     if old_draft:
-        db.applications_delete(old_draft["id"])
+        db.applications_delete(user_email, old_draft["id"])
         if old_draft["folder_path"] and os.path.isdir(old_draft["folder_path"]):
             shutil.rmtree(old_draft["folder_path"])
 
     priority_items = selection["priority_items"]
-    priority_items, floor_protected_ids = _balance_role_bullets(priority_items, db.point_bank_all())
-    roles, projects = _group_selected(priority_items)
+    priority_items, floor_protected_ids = _balance_role_bullets(priority_items, db.point_bank_all(user_email))
+    roles, projects = _group_selected(priority_items, user_email)
     # The project is deliberately left OUT of protected_ids -- it's always last in
     # priority_items (role bullets first, "other_items" i.e. the project appended after),
     # so a normal trim pass already reaches it before it would ever touch a role bullet,
@@ -643,8 +648,8 @@ def generate(job_id, summary, cover_letter_body, selection, out_root="data/appli
                 f.write(f"- [{'worth adding' if pa.get('worth_including') else 'skip'}] "
                         f"{pa.get('reason', '')}\n")
 
-    db.applications_add(job_id, pdf_path, cover_pdf, result, folder)
-    db.jobs_set_status(job_id, "generated")
+    db.applications_add(user_email, job_id, pdf_path, cover_pdf, result, folder)
+    db.jobs_set_status(user_email, job_id, "generated")
 
     return {"folder": folder, "ats": result, "roles": roles, "projects": projects,
             "resume_docx": docx_path, "resume_pdf": pdf_path,

@@ -63,17 +63,18 @@ How you talk (write like a person speaking, not like an AI assistant):
 """
 
 
-def _jobs_resume_body():
+def _jobs_resume_body(user_email):
     """(profile, skill_names, bullets_text, skills_line_text, candidate_years)
     -- the untailored candidate baseline, used to build the LLM-judge
     prompt (the only place a real fit judgment happens -- regex only ever
     does title/seniority/location/date classification, never scoring).
     bullets_text and skills_line_text are kept separate so the judge prompt
     can tell a skill demonstrated in real point-bank prose apart from one
-    only present in the bare Skills line."""
-    profile = jobsdb.profile_all()
-    skill_names = [s["name"] for s in jobsdb.skills_all()]
-    points = [p for p in jobsdb.point_bank_all() if not p["text"].lstrip().startswith("[")]
+    only present in the bare Skills line. Always THIS user's own master
+    doc -- two users scoring the same job never share a candidate baseline."""
+    profile = jobsdb.profile_all(user_email)
+    skill_names = [s["name"] for s in jobsdb.skills_all(user_email)]
+    points = [p for p in jobsdb.point_bank_all(user_email) if not p["text"].lstrip().startswith("[")]
     bullets_text = "\n".join(p["text"] for p in points)
     skills_line_text = ", ".join(skill_names)
     candidate_years = float(profile.get("years_experience", 0) or 0)
@@ -91,7 +92,7 @@ def _parse_json_col(value):
         return []
 
 
-def _job_public(j, applied_ids):
+def _job_public(j, applied_ids, user_email):
     # "stale" (judged, but your master doc changed since) is deliberately
     # distinct from "never judged" -- jobs_llm_score_stale() returns True
     # for both, but the UI already has its own "not judged" treatment for
@@ -102,7 +103,7 @@ def _job_public(j, applied_ids):
     # vs profile_version_ts() on every read, and llm_judged_ts only moves
     # when THAT posting is individually re-judged, so it can't clear any
     # other way.
-    stale = j["llm_score"] is not None and jobsdb.jobs_llm_score_stale(j)
+    stale = j["llm_score"] is not None and jobsdb.jobs_llm_score_stale(user_email, j)
     return {
         "id": j["id"], "company": j["company"], "title": j["title"], "url": j["url"],
         "source": j["source"], "status": j["status"],
@@ -142,7 +143,7 @@ def _days_cutoff(days_str, default=None):
     return _day_start_ts(days) if days > 0 else None
 
 
-def _filter_jobs(qs):
+def _filter_jobs(user_email, qs):
     """Shared by /api/jobs/list and /api/jobs/companies so the two always
     agree on what "matching" means -- a company's card count/best-score and
     the list you get after clicking into it must be the same filter,
@@ -154,7 +155,7 @@ def _filter_jobs(qs):
     matched_jobs already sorted newest-fetched first (jobs_query's own
     order) -- the company-card best_score below is computed by an explicit
     max-comparison loop, not by assuming row order, so this sort change
-    doesn't affect it."""
+    doesn't affect it. Scores/status are this user's own (see jobs_query)."""
     min_score = qs.get("min_score", [None])[0]
     eng_only = qs.get("eng_only", ["1"])[0] == "1"
     q_text = (qs.get("q", [""])[0] or "").lower()
@@ -174,7 +175,7 @@ def _filter_jobs(qs):
     date_cutoff = _days_cutoff(qs.get("days", [None])[0])
 
     return jobsdb.jobs_query(
-        status=qs.get("status", [None])[0], eng_only=eng_only, level_tiers=level_tiers,
+        user_email, status=qs.get("status", [None])[0], eng_only=eng_only, level_tiers=level_tiers,
         min_score=min_score, q_text=q_text, company_filter=company_filter,
         source_filter=source_filter, date_cutoff=date_cutoff, exclude_applied=True)
 
@@ -205,36 +206,51 @@ ZAI_API_KEY = os.environ.get("ZAI_API_KEY", "")
 GENERATE_LINK_SECRET = os.environ.get("GENERATE_LINK_SECRET", "") or ZAI_API_KEY
 
 
-def _sign_job_id(jid):
-    return hmac.new(GENERATE_LINK_SECRET.encode(), str(jid).encode(), hashlib.sha256).hexdigest()
+def _sign_job_user(user_email, jid):
+    """Signs (user_email, job_id) together, not just the job id -- a
+    Telegram one-click link has no cookie session, so the signature is
+    the ONLY thing establishing both "which job" and "whose score/
+    generate this is for." Signing the job id alone (the old scheme)
+    would let a link for one user's job_user_state row be replayed with
+    a different user= query param and silently act on someone else's
+    data."""
+    return hmac.new(GENERATE_LINK_SECRET.encode(), f"{user_email}|{jid}".encode(), hashlib.sha256).hexdigest()
 
 
-def _verify_job_sig(jid, sig):
+def _verify_job_user_sig(user_email, jid, sig):
     if not GENERATE_LINK_SECRET:
         return False
-    return hmac.compare_digest(_sign_job_id(jid), sig or "")
+    return hmac.compare_digest(_sign_job_user(user_email, jid), sig or "")
 
 
-# ── Google OAuth login gate ──────────────────────────────────────────────
-# Single-user: the only thing checked after Google confirms identity is
-# "does this email match ALLOWED_LOGIN_EMAIL" -- not a real multi-user
-# system, a lock on the front door for one person.
+# ── Google OAuth login gate + admin whitelist ────────────────────────────
+# Google only confirms WHO you are. Whether you're allowed to actually use
+# the app -- and whether you're the admin who can manage that whitelist --
+# is the `users` table (db.py), seeded from ALLOWED_LOGIN_EMAIL on first
+# run so the one person who was already the whole auth system becomes the
+# first admin automatically. Anyone who logs in but isn't in `users` is a
+# guest: identified, but with no private rows anywhere, so they see the
+# shared postings with nothing personalized and no real actions (every
+# mutating route below checks role via _require_whitelisted/_is_admin).
 GOOGLE_OAUTH_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
 GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
 ALLOWED_LOGIN_EMAIL = os.environ.get("ALLOWED_LOGIN_EMAIL", "")
 OAUTH_REDIRECT_URI = os.environ.get("OAUTH_REDIRECT_URI", f"http://localhost:{PORT}/auth/google/callback")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "") or GENERATE_LINK_SECRET
-SESSION_MAX_AGE = 30 * 24 * 3600  # 30 days -- one person's own tool, not a shared login
+SESSION_MAX_AGE = 30 * 24 * 3600  # 30 days
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
 
 # Reachable with no session at all: the login flow itself (can't require a
 # session to reach the page that creates one), and the generate-link/
-# view-details endpoints, which already have their own HMAC-signature auth
-# (_verify_job_sig) -- that's the whole point of them being one-click links
-# from a Telegram notification, not something that requires first being
-# logged in.
+# view-details/download endpoints, which already have their own HMAC-
+# signature auth (_verify_job_user_sig) -- that's the whole point of them
+# being one-click links from a Telegram notification, not something that
+# requires first being logged in. Everything else -- including the SPA
+# page itself -- still requires a completed Google login; a guest is
+# anyone logged in whose email just isn't on the whitelist, not someone
+# browsing with no session at all.
 AUTH_EXEMPT_PREFIXES = ("/auth/google/", "/api/jobs/generate-link", "/api/jobs/view-details",
                          "/api/jobs/download-resume", "/api/jobs/download-cover")
 
@@ -257,9 +273,11 @@ def _parse_cookies(cookie_header):
 
 def _valid_session_email(cookie_header):
     """The logged-in email if the session cookie is present, correctly
-    signed, unexpired, and matches ALLOWED_LOGIN_EMAIL -- None otherwise.
-    A forged, tampered, or expired cookie is treated identically to no
-    cookie at all, never partially trusted."""
+    signed, and unexpired -- None otherwise. A forged, tampered, or
+    expired cookie is treated identically to no cookie at all, never
+    partially trusted. This only confirms WHO (Google already vouched for
+    the email) -- it does NOT mean they're allowed to use the app; see
+    _user_role for that."""
     raw = _parse_cookies(cookie_header).get("session")
     if not raw:
         return None
@@ -272,9 +290,17 @@ def _valid_session_email(cookie_header):
         return None
     if int(expiry) < time.time():
         return None
-    if email != ALLOWED_LOGIN_EMAIL:
-        return None
     return email
+
+
+def _user_role(email):
+    """'admin' | 'whitelisted' | 'guest' -- guest means a real, confirmed
+    Google login that just isn't on the whitelist. Never None: every
+    confirmed email resolves to one of these three."""
+    if not email:
+        return "guest"
+    user = jobsdb.users_get(email)
+    return user["role"] if user else "guest"
 
 
 def _google_auth_redirect_url(state):
@@ -1088,7 +1114,7 @@ def _zai_select_content(job, profile, point_bank_items, skill_names, candidate_y
     return {"priority_items": salvaged, "skills": skills, "role_assessment": role_assessment}
 
 
-def _cached_score_for_job(job):
+def _cached_score_for_job(user_email, job):
     """The job's already-judged Call 1 result, in the exact shape
     _zai_score_requirements returns, or None if it's never been judged or
     was judged before the master doc (point bank/skills/profile) last
@@ -1096,7 +1122,7 @@ def _cached_score_for_job(job):
     AI-judge button, reused here so generate() can skip a redundant,
     independent re-score instead of silently producing a second, possibly
     different, number for the same posting."""
-    if jobsdb.jobs_llm_score_stale(job):
+    if jobsdb.jobs_llm_score_stale(user_email, job):
         return None
     requirements = json.loads(job["llm_requirements"] or "[]")
     if not requirements:
@@ -1116,8 +1142,8 @@ def _cached_score_for_job(job):
     }
 
 
-def _zai_generate_and_score(job, profile, point_bank_items, skill_names, candidate_years, forced_project_ids=None,
-                             tuning_key="generate_batch"):
+def _zai_generate_and_score(job, user_email, profile, point_bank_items, skill_names, candidate_years,
+                             forced_project_ids=None, tuning_key="generate_batch"):
     """Thin orchestrator over the two-call split above: _zai_score_requirements
     (Call 1 -- requirements/score/gaps/project worth_including) then
     _zai_select_content (Call 2 -- role-item selection/reword/skills,
@@ -1147,7 +1173,7 @@ def _zai_generate_and_score(job, profile, point_bank_items, skill_names, candida
     with no real change in between. Same staleness rule the AI-judge button
     itself already uses (jobs_llm_score_stale), so a master-doc edit still
     forces a genuine re-score here, same as it always has."""
-    scored = _cached_score_for_job(job)
+    scored = _cached_score_for_job(user_email, job)
     if scored is None:
         scored = _zai_score_requirements(job, profile, point_bank_items, candidate_years, tuning_key=tuning_key)
         if scored is None:
@@ -1477,33 +1503,51 @@ def _zai_tidy_company(company, role, existing_texts):
 # would use, so the pre-generation score is never a different number for a
 # different reason than the real one -- one judge, used consistently,
 # whether scoring one posting, all of them, or actually generating.
+# GLOBAL, not per-user -- one AI-judge batch at a time for the whole server
+# regardless of who clicked it, same resource-conservation reasoning as the
+# single generate worker below (shared LLM budget/rate limit, not a
+# per-user ceiling). _judge_progress_by_user tracks each user's own last
+# batch state for display; whichever user's batch is actually running
+# holds _judge_lock, and everyone else's poll just reports "not running".
 _judge_lock = threading.Lock()
-# Loaded from disk, not just started blank -- survives a server restart.
-# If the persisted state says a batch was "running", the process that was
-# running it is gone (this is a fresh process starting up) -- correcting
-# that to "interrupted" here is the one honest thing to do with it.
-_judge_progress = jobsdb.judge_progress_get() or {
-    "running": False, "total": 0, "done": 0, "judged": 0, "failed": [], "started_ts": None}
-if _judge_progress.get("running"):
-    _judge_progress["running"] = False
-    _judge_progress["interrupted"] = True
+_judge_progress_by_user = {}
 
 
-def _judge_progress_update(**kwargs):
-    """The one place _judge_progress changes -- updates the in-memory copy
-    and writes it straight through to disk in the same call, so every
-    real change (not just the final one) is recoverable after a restart."""
-    _judge_progress.update(kwargs)
-    jobsdb.judge_progress_set(_judge_progress)
+def _get_judge_progress(user_email):
+    """Lazily loads this user's last-known state from disk on first access
+    (not all at module-import time -- there's no fixed list of users to
+    preload) -- survives a server restart. If the persisted state says a
+    batch was "running", the process that was running it is gone (this is
+    a fresh process) -- correcting that to "interrupted" here is the one
+    honest thing to do with it."""
+    if user_email not in _judge_progress_by_user:
+        p = jobsdb.judge_progress_get(user_email) or {
+            "running": False, "total": 0, "done": 0, "judged": 0, "failed": [], "started_ts": None}
+        if p.get("running"):
+            p["running"] = False
+            p["interrupted"] = True
+        _judge_progress_by_user[user_email] = p
+    return _judge_progress_by_user[user_email]
 
 
-def _score_only(job, profile, point_bank_items, candidate_years, tuning_key="judge_batch"):
+def _judge_progress_update(user_email, **kwargs):
+    """The one place a user's judge progress changes -- updates the
+    in-memory copy and writes it straight through to disk in the same
+    call, so every real change (not just the final one) is recoverable
+    after a restart."""
+    p = _get_judge_progress(user_email)
+    p.update(kwargs)
+    jobsdb.judge_progress_set(user_email, p)
+
+
+def _score_only(user_email, job, profile, point_bank_items, candidate_years, tuning_key="judge_batch"):
     """Runs _zai_score_requirements (Call 1 only -- scoring never needs
     Call 2's content-selection work, which score-only callers always threw
-    away unused), writes the score-relevant fields onto the job row.
-    Returns (True, None) if a real score landed, (False, reason) if the
-    call/parse failed (caller treats that as "not scored yet", same
-    discipline as before) -- a real reason, not just a bool.
+    away unused), writes the score-relevant fields onto THIS USER's own
+    job_user_state row for the job. Returns (True, None) if a real score
+    landed, (False, reason) if the call/parse failed (caller treats that
+    as "not scored yet", same discipline as before) -- a real reason, not
+    just a bool.
 
     tuning_key: "judge_batch" (default, the AI-judge batch loop) or
     "rescore_single" (the single-job /api/jobs/rescore endpoint) -- see
@@ -1511,7 +1555,7 @@ def _score_only(job, profile, point_bank_items, candidate_years, tuning_key="jud
     result = _zai_score_requirements(job, profile, point_bank_items, candidate_years, tuning_key=tuning_key)
     if result is None:
         return False, "LLM call failed or returned unusable content -- see server logs"
-    jobsdb.jobs_set_llm_score(job["id"], result["score"], result["reason"],
+    jobsdb.jobs_set_llm_score(user_email, job["id"], result["score"], result["reason"],
                                missing=result["missing"], projects=result["project_assessment"],
                                requirements=result["requirements"])
     return True, None
@@ -1576,13 +1620,14 @@ def _cluster_missing_gaps(scored_jobs):
         return []
 
 
-def _run_judge_batch(candidates, profile, point_bank_items, candidate_years):
+def _run_judge_batch(user_email, candidates, profile, point_bank_items, candidate_years):
     """Returns False without starting anything if a batch is already
-    running -- one at a time app-wide, so two clicks don't double-spend
-    on the same candidates."""
-    if _judge_progress["running"]:
+    running -- for ANY user, one at a time server-wide, so two clicks (by
+    the same or different users) don't double-spend the shared LLM
+    budget on overlapping work."""
+    if _judge_lock.locked():
         return False
-    _judge_progress_update(running=True, total=len(candidates), done=0,
+    _judge_progress_update(user_email, running=True, total=len(candidates), done=0,
                             judged=0, failed=[], started_ts=time.time(), interrupted=False)
 
     def run():
@@ -1590,13 +1635,13 @@ def _run_judge_batch(candidates, profile, point_bank_items, candidate_years):
             try:
                 for j in candidates:
                     try:
-                        fresh = jobsdb.jobs_get(j["id"])
+                        fresh = jobsdb.jobs_get(user_email, j["id"])
                         if fresh is not None:
-                            ok, reason = _score_only(fresh, profile, point_bank_items, candidate_years)
+                            ok, reason = _score_only(user_email, fresh, profile, point_bank_items, candidate_years)
                             if ok:
-                                _judge_progress_update(judged=_judge_progress["judged"] + 1)
+                                _judge_progress_update(user_email, judged=_get_judge_progress(user_email)["judged"] + 1)
                             else:
-                                _judge_progress_update(failed=_judge_progress["failed"] + [
+                                _judge_progress_update(user_email, failed=_get_judge_progress(user_email)["failed"] + [
                                     {"job_id": fresh["id"], "title": fresh["title"],
                                      "company": fresh["company"], "reason": reason}])
                     except Exception as e:
@@ -1609,11 +1654,11 @@ def _run_judge_batch(candidates, profile, point_bank_items, candidate_years):
                         # the one-at-a-time lock looking exactly like "AI-judge is
                         # broken" when the real batch had silently died minutes in.
                         print(f"[jobs] judge batch: unexpected error on job {j.get('id')}: {e}", file=sys.stderr)
-                        _judge_progress_update(failed=_judge_progress["failed"] + [
+                        _judge_progress_update(user_email, failed=_get_judge_progress(user_email)["failed"] + [
                             {"job_id": j.get("id"), "title": "", "company": "", "reason": f"unexpected error: {e}"}])
-                    _judge_progress_update(done=_judge_progress["done"] + 1)
+                    _judge_progress_update(user_email, done=_get_judge_progress(user_email)["done"] + 1)
             finally:
-                _judge_progress_update(running=False)
+                _judge_progress_update(user_email, running=False)
     threading.Thread(target=run, daemon=True).start()
     return True
 
@@ -1626,71 +1671,87 @@ def _run_judge_batch(candidates, profile, point_bank_items, candidate_years):
 # would -- same one-page enforcement, same Keyword+Use+Result bullet
 # filter, same PDF export. One quality bar regardless of who wrote the
 # prose.
-_generate_lock = threading.Lock()
-_generate_progress = {"running": False, "total": 0, "done": 0, "generated": 0,
-                       "failed": [], "started_ts": None}
+_generate_progress_by_user = {}
+_generate_batch_locks = collections.defaultdict(threading.Lock)
+
+
+def _get_generate_batch_progress(user_email):
+    if user_email not in _generate_progress_by_user:
+        _generate_progress_by_user[user_email] = {
+            "running": False, "total": 0, "done": 0, "generated": 0, "failed": [], "started_ts": None}
+    return _generate_progress_by_user[user_email]
+
 
 # ONE real queue, ONE persistent worker thread (started once in main(), below) --
 # every generate request in the whole app funnels through this, full stop: the
 # Telegram "Generate now" link, the web UI's single "Add project to resume"
-# button, and the "Generate queued" batch. Replaced three separate mechanisms
-# (a raw per-click thread spawn with no concurrency bound at all, a blocking
-# synchronous request, and a dedicated batch-only thread) with this one.
-# Strictly serial on purpose -- real resource ceiling (one soffice process, one
-# set of LLM calls, at a time) regardless of how many requests arrive at once,
-# which the old per-click-thread version had no protection against whatsoever:
-# ten quick Telegram clicks would have spawned ten simultaneous pipelines.
+# button, and the "Generate queued" batch, for every user. Replaced three
+# separate mechanisms (a raw per-click thread spawn with no concurrency bound
+# at all, a blocking synchronous request, and a dedicated batch-only thread)
+# with this one. Strictly serial on purpose -- real resource ceiling (one
+# soffice process, one set of LLM calls, at a time) regardless of how many
+# requests arrive at once or from how many users, which the old per-click-
+# thread version had no protection against whatsoever: ten quick Telegram
+# clicks would have spawned ten simultaneous pipelines.
 _generate_queue = queue.Queue()
-_generate_status = {}        # job_id -> {"state", "error", "queued_ts", "done_ts"}
+_generate_status = {}        # (user_email, job_id) -> {"state", "error", "queued_ts", "done_ts"}
 _generate_status_lock = threading.Lock()
 
 
 def _generate_worker_loop():
     while True:
         task = _generate_queue.get()
-        jid = task["job_id"]
+        user_email, jid = task["user_email"], task["job_id"]
+        key = (user_email, jid)
         with _generate_status_lock:
-            _generate_status[jid]["state"] = "running"
+            _generate_status[key]["state"] = "running"
         try:
-            ok, err = _generate_single_job(jid, forced_project_ids=task.get("forced_project_ids"))
+            ok, err = _generate_single_job(user_email, jid, forced_project_ids=task.get("forced_project_ids"))
         except Exception as e:
             ok, err = False, f"unexpected error: {e}"
         with _generate_status_lock:
-            _generate_status[jid]["state"] = "done" if ok else "failed"
-            _generate_status[jid]["error"] = err
-            _generate_status[jid]["done_ts"] = time.time()
+            _generate_status[key]["state"] = "done" if ok else "failed"
+            _generate_status[key]["error"] = err
+            _generate_status[key]["done_ts"] = time.time()
         if task.get("notify_telegram"):
-            fresh = jobsdb.jobs_get(jid)
+            fresh = jobsdb.jobs_get(user_email, jid)
+            cfg = jobsdb.telegram_config_get(user_email)
+            bot_token = cfg["bot_token"] if cfg else None
+            chat_id = cfg["chat_id"] if cfg else None
             if ok and fresh is not None:
-                sig = _sign_job_id(jid)
-                resume_url = f"{_public_base_url()}/api/jobs/download-resume?job_id={jid}&sig={sig}"
-                cover_url = f"{_public_base_url()}/api/jobs/download-cover?job_id={jid}&sig={sig}"
-                notify_telegram.send_generation_complete(fresh, resume_url, cover_url)
+                sig = _sign_job_user(user_email, jid)
+                resume_url = f"{_public_base_url()}/api/jobs/download-resume?job_id={jid}&user={user_email}&sig={sig}"
+                cover_url = f"{_public_base_url()}/api/jobs/download-cover?job_id={jid}&user={user_email}&sig={sig}"
+                notify_telegram.send_generation_complete(fresh, resume_url, cover_url,
+                                                          bot_token=bot_token, chat_id=chat_id)
             else:
-                print(f"[jobs] queued generate failed for job {jid}: {err}", file=sys.stderr)
+                print(f"[jobs] queued generate failed for job {jid} (user {user_email}): {err}", file=sys.stderr)
                 if fresh is not None:
-                    notify_telegram.send_generation_failed(fresh, err)
+                    notify_telegram.send_generation_failed(fresh, err, bot_token=bot_token, chat_id=chat_id)
         _generate_queue.task_done()
 
 
-def _enqueue_generate(jid, forced_project_ids=None, notify_telegram_on_done=False):
+def _enqueue_generate(user_email, jid, forced_project_ids=None, notify_telegram_on_done=False):
     """The one entry point every caller funnels through. Returns "no_such_job",
     "noop" (already generated, unchanged -- see _needs_regenerate; skipped when
     forced_project_ids is given, same reasoning as _generate_single_job),
     "already_running" (already queued or actively generating -- never a
-    duplicate), or "started"."""
-    job = jobsdb.jobs_get(jid)
+    duplicate), or "started". Keyed by (user_email, job_id) -- two different
+    users generating the same shared job independently never collide or
+    block each other; the single worker just processes both in turn."""
+    job = jobsdb.jobs_get(user_email, jid)
     if job is None:
         return "no_such_job"
-    if not forced_project_ids and not _needs_regenerate(job):
+    if not forced_project_ids and not _needs_regenerate(user_email, job):
         return "noop"
+    key = (user_email, jid)
     with _generate_status_lock:
-        existing = _generate_status.get(jid)
+        existing = _generate_status.get(key)
         if existing is not None and existing["state"] in ("queued", "running"):
             return "already_running"
-        _generate_status[jid] = {"state": "queued", "error": None,
+        _generate_status[key] = {"state": "queued", "error": None,
                                   "queued_ts": time.time(), "done_ts": None}
-    _generate_queue.put({"job_id": jid, "forced_project_ids": forced_project_ids,
+    _generate_queue.put({"user_email": user_email, "job_id": jid, "forced_project_ids": forced_project_ids,
                           "notify_telegram": notify_telegram_on_done})
     return "started"
 
@@ -1703,16 +1764,17 @@ def _public_base_url():
     return os.environ.get("JOBSEARCH_BASE_URL", f"http://localhost:{PORT}")
 
 
-def _generate_one(job_id, summary, cover_letter_body, selection):
+def _generate_one(job_id, user_email, summary, cover_letter_body, selection):
     """Shells into this project's own .venv the same way the manual
     /api/jobs/generate handler does -- one real code path for "how a
     resume gets rendered" regardless of whether Claude or Zai wrote the
     prose. `selection` is _zai_generate_and_score's output, passed through
-    as plain data -- generate.py never calls an LLM itself.
+    as plain data -- generate.py never calls an LLM itself. user_email:
+    whose own point_bank/profile this pulls from inside generate.py.
     Returns (ok, error_or_None)."""
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        json.dump({"job_id": job_id, "summary": summary, "cover_letter_body": cover_letter_body,
-                    "selection": selection}, f)
+        json.dump({"job_id": job_id, "user_email": user_email, "summary": summary,
+                    "cover_letter_body": cover_letter_body, "selection": selection}, f)
         req_path = f.name
     try:
         out = subprocess.run(
@@ -1738,16 +1800,16 @@ def _generate_one(job_id, summary, cover_letter_body, selection):
     return True, None
 
 
-def _needs_regenerate(job):
-    """True only if this job has never been generated, or has been
-    rescored (master-doc edit, or an explicit "Clear scores") since its
-    last generation. Repeat clicks on the same "Generate now" link --
-    e.g. clicking it again from the same Telegram message -- otherwise
-    burned a full score+select+draft+render pass (three real LLM calls)
-    and silently overwrote the exact same files every single time, found
-    live as a real concern: nothing stopped a job from being regenerated
-    an unbounded number of times for zero actual change."""
-    draft = jobsdb.applications_find_draft(job["id"])
+def _needs_regenerate(user_email, job):
+    """True only if this job has never been generated FOR THIS USER, or
+    has been rescored (master-doc edit, or an explicit "Clear scores")
+    since its last generation. Repeat clicks on the same "Generate now"
+    link -- e.g. clicking it again from the same Telegram message --
+    otherwise burned a full score+select+draft+render pass (three real
+    LLM calls) and silently overwrote the exact same files every single
+    time, found live as a real concern: nothing stopped a job from being
+    regenerated an unbounded number of times for zero actual change."""
+    draft = jobsdb.applications_find_draft(user_email, job["id"])
     if draft is None:
         return True
     # No real judged_ts at all (score was explicitly cleared, or never judged) means
@@ -1760,25 +1822,27 @@ def _needs_regenerate(job):
     return job["llm_judged_ts"] > draft["generated_ts"]
 
 
-def _generate_single_job(jid, forced_project_ids=None):
+def _generate_single_job(user_email, jid, forced_project_ids=None):
     """The same score->select->draft->render pipeline _run_generate_batch
     runs per job in a batch, but for exactly one job -- what the poll
     script's emailed "Generate now" link triggers, and (via
     forced_project_ids) what the web UI's "Add project to resume" button
     triggers too, now the same one function instead of two separate code
-    paths. Returns (ok, error_or_None). A no-op success (True, None) if
-    the job is already generated and hasn't been rescored since -- see
+    paths. Always builds from user_email's own master doc and writes to
+    their own job_user_state/applications rows for this shared job.
+    Returns (ok, error_or_None). A no-op success (True, None) if the job
+    is already generated and hasn't been rescored since -- see
     _needs_regenerate (skipped entirely when forced_project_ids is given,
     since forcing a specific project is always an explicit, deliberate
     regenerate request, never a repeat click to de-duplicate)."""
-    job = jobsdb.jobs_get(jid)
+    job = jobsdb.jobs_get(user_email, jid)
     if not job:
         return False, "no such job"
-    if not forced_project_ids and not _needs_regenerate(job):
+    if not forced_project_ids and not _needs_regenerate(user_email, job):
         return True, None
-    profile, skill_names, _bullets_text, _skills_line, candidate_years = _jobs_resume_body()
-    point_bank_items = jobsdb.point_bank_all()
-    selection = _zai_generate_and_score(job, profile, point_bank_items, skill_names,
+    profile, skill_names, _bullets_text, _skills_line, candidate_years = _jobs_resume_body(user_email)
+    point_bank_items = jobsdb.point_bank_all(user_email)
+    selection = _zai_generate_and_score(job, user_email, profile, point_bank_items, skill_names,
                                          candidate_years, forced_project_ids=forced_project_ids,
                                          tuning_key="generate_single")
     if selection is None:
@@ -1788,19 +1852,23 @@ def _generate_single_job(jid, forced_project_ids=None):
                                                          candidate_years, tuning_key="generate_single")
     if summary is None:
         return False, draft_err
-    ok, err = _generate_one(jid, summary, cover, selection)
+    ok, err = _generate_one(jid, user_email, summary, cover, selection)
     if not ok:
         return False, err
-    jobsdb.jobs_set_llm_score(jid, selection["score"], selection["reason"],
+    jobsdb.jobs_set_llm_score(user_email, jid, selection["score"], selection["reason"],
                                missing=selection["missing"], projects=selection["project_assessment"],
                                requirements=selection["requirements"])
     return True, None
 
 
-def _run_generate_batch(candidates):
-    """candidates: queued jobs. Returns False without starting anything if
-    a batch is already running -- same one-at-a-time rule the judge batch
-    uses, so two clicks don't double-draft the same jobs.
+def _run_generate_batch(user_email, candidates):
+    """candidates: this user's own queued jobs. Returns False without
+    starting anything if a batch is already running FOR THIS USER -- same
+    one-at-a-time rule the judge batch uses, so two clicks don't double-
+    draft the same jobs; a different user's own batch is tracked
+    separately and doesn't block this one (the underlying work is still
+    strictly serial through the one shared worker below, just the
+    per-user progress bookkeeping is independent).
 
     Enqueues every candidate onto the SAME single shared generate queue
     _enqueue_generate() funnels every other generate request through (the
@@ -1813,24 +1881,25 @@ def _run_generate_batch(candidates):
     status's existing {running, total, done, generated, failed} response
     shape working exactly as the UI already expects, so no frontend change
     was needed for the batch flow specifically."""
-    if _generate_progress["running"]:
+    progress = _get_generate_batch_progress(user_email)
+    if progress["running"]:
         return False
-    fresh_candidates = [jobsdb.jobs_get(j["id"]) for j in candidates]
+    fresh_candidates = [jobsdb.jobs_get(user_email, j["id"]) for j in candidates]
     job_ids = [j["id"] for j in fresh_candidates if j is not None and j["status"] == "queued"]
-    _generate_progress.update({"running": True, "total": len(job_ids), "done": 0,
-                                "generated": 0, "failed": [], "started_ts": time.time()})
+    progress.update({"running": True, "total": len(job_ids), "done": 0,
+                      "generated": 0, "failed": [], "started_ts": time.time()})
     pending = set()
     for jid in job_ids:
-        state = _enqueue_generate(jid, notify_telegram_on_done=False)
+        state = _enqueue_generate(user_email, jid, notify_telegram_on_done=False)
         if state in ("started", "already_running"):
             pending.add(jid)
         else:   # "noop" or "no_such_job" -- already resolved, nothing to wait on
-            job = jobsdb.jobs_get(jid)
-            _generate_progress["done"] += 1
+            job = jobsdb.jobs_get(user_email, jid)
+            progress["done"] += 1
             if state == "noop":
-                _generate_progress["generated"] += 1
+                progress["generated"] += 1
             else:
-                _generate_progress["failed"].append(
+                progress["failed"].append(
                     {"job_id": jid, "title": job["title"] if job else "",
                      "company": job["company"] if job else "", "reason": state})
 
@@ -1841,23 +1910,23 @@ def _run_generate_batch(candidates):
             finished = set()
             for jid in remaining:
                 with _generate_status_lock:
-                    st = dict(_generate_status.get(jid) or {})
+                    st = dict(_generate_status.get((user_email, jid)) or {})
                 if st.get("state") in ("done", "failed"):
                     finished.add(jid)
-                    _generate_progress["done"] += 1
+                    progress["done"] += 1
                     if st["state"] == "done":
-                        _generate_progress["generated"] += 1
+                        progress["generated"] += 1
                     else:
-                        job = jobsdb.jobs_get(jid)
-                        _generate_progress["failed"].append(
+                        job = jobsdb.jobs_get(user_email, jid)
+                        progress["failed"].append(
                             {"job_id": jid, "title": job["title"] if job else "",
                              "company": job["company"] if job else "", "reason": st.get("error")})
             remaining -= finished
-        _generate_progress["running"] = False
+        progress["running"] = False
     if pending:
         threading.Thread(target=track, daemon=True).start()
     else:
-        _generate_progress["running"] = False
+        progress["running"] = False
     return True
 
 
@@ -1881,11 +1950,10 @@ def _run_fetch_async():
     def run():
         with _fetch_lock:
             try:
-                before = {j["id"] for j in jobsdb.jobs_list()}
+                before = jobsdb.jobs_ids()
                 out = subprocess.run([VENV_PY, "fetch_ats.py"], capture_output=True,
                                       text=True, timeout=600, cwd=ROOT)
-                after_jobs = jobsdb.jobs_list()
-                new_job_ids = {j["id"] for j in after_jobs if j["id"] not in before}
+                new_job_ids = jobsdb.jobs_ids() - before
                 _fetch_progress.update({
                     "ok": out.returncode == 0, "new_postings": len(new_job_ids),
                     "added_today": jobsdb.jobs_added_count(_day_start_ts(0)),
@@ -2007,6 +2075,31 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", "0") or 0)
         return json.loads(self.rfile.read(n) or b"{}")
 
+    def _session_email(self):
+        return _valid_session_email(self.headers.get("Cookie", ""))
+
+    def _session_role(self):
+        return _user_role(self._session_email())
+
+    def _require_whitelisted(self):
+        """Returns the session email if it's admin or whitelisted, else
+        writes a 403 and returns None -- the one gate every mutating
+        route (and every private-data read) goes through, so a guest
+        account literally cannot touch another user's data or trigger a
+        real action, not just have the buttons hidden in the UI."""
+        email = self._session_email()
+        if _user_role(email) == "guest":
+            self._json({"error": "Ask the admin to whitelist your account first."}, 403)
+            return None
+        return email
+
+    def _require_admin(self):
+        email = self._session_email()
+        if _user_role(email) != "admin":
+            self._json({"error": "admin only"}, 403)
+            return None
+        return email
+
     def _html(self, body_text, code=200):
         body = body_text.encode()
         self.send_response(code)
@@ -2054,15 +2147,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _serve_signed_job_file(self, jid, sig, filename):
+    def _serve_signed_job_file(self, user_email, jid, sig, filename):
         """resume.pdf / cover_letter.pdf for one job, via the same HMAC-signature
         auth as generate-link/view-details -- a Telegram download link, not a
-        logged-in browser session. The real folder comes from the applications
-        table (the most recent one for this job), never trusted from the URL,
-        so this can't be used to probe for arbitrary files."""
-        if not jid or not _verify_job_sig(jid, sig):
+        logged-in browser session. The real folder comes from THIS user's own
+        applications row for this job (never trusted from the URL, so this
+        can't be used to probe for arbitrary files, and never another user's
+        row for the same shared job)."""
+        if not jid or not _verify_job_user_sig(user_email, jid, sig):
             return self._html("<h1>Invalid or expired link</h1>", 403)
-        apps = jobsdb.applications_for_job(jid)
+        apps = jobsdb.applications_for_job(user_email, jid)
         if not apps:
             return self._html("<h1>Not generated yet</h1>", 404)
         full = os.path.join(apps[0]["folder_path"], filename)
@@ -2096,9 +2190,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._html("<h1>Login failed</h1><p>Invalid or expired login attempt -- "
                                    "try <a href=\"/auth/google/login\">logging in</a> again.</p>", 400)
             email = _google_exchange_code(code)
-            if not email or email != ALLOWED_LOGIN_EMAIL:
-                return self._html("<h1>Not authorized</h1><p>That Google account isn't allowed to "
-                                   "access this app.</p>", 403)
+            if not email:
+                return self._html("<h1>Login failed</h1><p>Google didn't return a confirmed email -- "
+                                   "try <a href=\"/auth/google/login\">logging in</a> again.</p>", 400)
+            # Any confirmed Google account gets a session now -- WHETHER they're
+            # whitelisted (full access), admin (also whitelist control), or a
+            # guest (read-only preview, every action blocked server-side) is
+            # decided per-request from the `users` table, not at login time.
             self.send_response(302)
             self.send_header("Location", "/jobs/")
             self.send_header("Set-Cookie", f"session={_make_session_cookie(email)}; "
@@ -2120,16 +2218,19 @@ class Handler(BaseHTTPRequestHandler):
             # Google OAuth gate -- opened fresh from a Telegram message,
             # not a live logged-in browser session. The HMAC signature IS
             # the auth here: only a link this server itself signed (via
-            # _sign_job_id, using a secret that never leaves the server)
-            # can trigger a real generate. A plain HTML response, not
-            # JSON -- a human opens this link in a browser, not an API
-            # client.
+            # _sign_job_user, using a secret that never leaves the server)
+            # can trigger a real generate, and it's signed over (user, job)
+            # together, so it can only ever act on the one user's own
+            # job_user_state/applications row for this job. A plain HTML
+            # response, not JSON -- a human opens this link in a browser,
+            # not an API client.
             try:
                 jid = int(qs.get("job_id", ["0"])[0])
             except ValueError:
                 jid = 0
             sig = qs.get("sig", [""])[0]
-            if not jid or not _verify_job_sig(jid, sig):
+            link_user = qs.get("user", [""])[0]
+            if not jid or not link_user or not _verify_job_user_sig(link_user, jid, sig):
                 return self._html("<h1>Invalid or expired link</h1>", 403)
             # Async, not synchronous -- a real generate is 3 LLM calls plus rendering,
             # 1-3+ minutes on this hardware, and the old version blocked the whole
@@ -2139,13 +2240,13 @@ class Handler(BaseHTTPRequestHandler):
             # work in the background and respond immediately; a follow-up Telegram
             # message with real download links (or a real failure reason) arrives
             # once it's actually done, never making the click itself wait.
-            state = _enqueue_generate(jid, notify_telegram_on_done=True)
-            job = jobsdb.jobs_get(jid)
+            state = _enqueue_generate(link_user, jid, notify_telegram_on_done=True)
+            job = jobsdb.jobs_get(link_user, jid)
             title = f"{job['title']} @ {job['company']}" if job else f"job {jid}"
             if state == "noop":
-                sig2 = _sign_job_id(jid)
-                resume_url = f"{_public_base_url()}/api/jobs/download-resume?job_id={jid}&sig={sig2}"
-                cover_url = f"{_public_base_url()}/api/jobs/download-cover?job_id={jid}&sig={sig2}"
+                sig2 = _sign_job_user(link_user, jid)
+                resume_url = f"{_public_base_url()}/api/jobs/download-resume?job_id={jid}&user={link_user}&sig={sig2}"
+                cover_url = f"{_public_base_url()}/api/jobs/download-cover?job_id={jid}&user={link_user}&sig={sig2}"
                 return self._html(
                     f"<h1>Already generated</h1><p>{title} hasn't been rescored since its last "
                     f"generation, so nothing changed -- here are the existing files: "
@@ -2167,8 +2268,9 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 jid = 0
             sig = qs.get("sig", [""])[0]
+            link_user = qs.get("user", [""])[0]
             filename = "resume.pdf" if p == "/api/jobs/download-resume" else "cover_letter.pdf"
-            return self._serve_signed_job_file(jid, sig, filename)
+            return self._serve_signed_job_file(link_user, jid, sig, filename)
 
         if p == "/api/jobs/view-details":
             # The "View JD" button in the Telegram notification -- kept the
@@ -2181,9 +2283,10 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 jid = 0
             sig = qs.get("sig", [""])[0]
-            if not jid or not _verify_job_sig(jid, sig):
+            link_user = qs.get("user", [""])[0]
+            if not jid or not link_user or not _verify_job_user_sig(link_user, jid, sig):
                 return self._html("<h1>Invalid or expired link</h1>", 403)
-            job = jobsdb.jobs_get(jid)
+            job = jobsdb.jobs_get(link_user, jid)
             if not job:
                 return self._html("<h1>No such job</h1>", 404)
             import html as _html_lib
@@ -2199,18 +2302,19 @@ class Handler(BaseHTTPRequestHandler):
                 f"{_html_lib.escape(job.get('description_raw', ''))}</pre>")
 
         if p == "/api/jobs/list":
-            total_unfiltered, matched = _filter_jobs(qs)
+            email = self._session_email()
+            total_unfiltered, matched = _filter_jobs(email, qs)
             page = max(1, int(qs.get("page", ["1"])[0]))
             per_page = max(1, min(100, int(qs.get("per_page", ["10"])[0])))
-            applied_ids = {a["job_id"] for a in jobsdb.applications_all() if a["status"] != "generated"}
+            applied_ids = {a["job_id"] for a in jobsdb.applications_all(email) if a["status"] != "generated"}
             start = (page - 1) * per_page
-            page_jobs = [_job_public(j, applied_ids) for j in matched[start:start + per_page]]
+            page_jobs = [_job_public(j, applied_ids, email) for j in matched[start:start + per_page]]
             return self._json({"jobs": page_jobs, "total_matched": len(matched), "total_unfiltered": total_unfiltered,
                                 "page": page, "per_page": per_page,
                                 "total_pages": max(1, (len(matched) + per_page - 1) // per_page)})
 
         if p == "/api/jobs/companies":
-            _, matched = _filter_jobs(qs)
+            _, matched = _filter_jobs(self._session_email(), qs)
             by_company = {}
             for j in matched:
                 c = by_company.setdefault(j["company"], {"company": j["company"], "count": 0,
@@ -2230,56 +2334,66 @@ class Handler(BaseHTTPRequestHandler):
             # Plain tab-open (no refresh=1) returns the last computed
             # result instantly; only an explicit Refresh (or a scoped
             # rejudge finishing, see rejudge-cluster below) recomputes and
-            # overwrites the cache.
-            cached = jobsdb.gap_clusters_get()
+            # overwrites the cache. Per user -- built from each person's
+            # own scored jobs.
+            email = self._session_email()
+            cached = jobsdb.gap_clusters_get(email)
             if qs.get("refresh", ["0"])[0] != "1" and cached is not None:
                 return self._json(cached)
-            scored = [j for j in jobsdb.jobs_list() if j["llm_score"] is not None]
+            scored = [j for j in jobsdb.jobs_list(email) if j["llm_score"] is not None]
             clusters = _cluster_missing_gaps(scored)
             result = {"clusters": clusters, "scored_count": len(scored), "computed_ts": time.time()}
-            jobsdb.gap_clusters_set(result)
+            jobsdb.gap_clusters_set(email, result)
             return self._json(result)
 
         if p == "/api/jobs/llm-backfill/status":
             # Polled by the UI while a batch is running -- real progress
             # (judged so far / total), not a guess, since each score is
-            # written to the db the moment that one call finishes.
-            return self._json(dict(_judge_progress))
+            # written to the db the moment that one call finishes. Per
+            # user -- someone else's AI-judge batch (if one is running;
+            # only one at a time, server-wide, to protect the shared LLM
+            # budget) shows as "not running" to everyone else, not as if
+            # it were their own.
+            return self._json(dict(_get_judge_progress(self._session_email())))
 
         if p == "/api/jobs/refetch/status":
             return self._json(dict(_fetch_progress))
 
         if p == "/api/jobs/generate-queued/status":
-            return self._json(dict(_generate_progress))
+            return self._json(dict(_get_generate_batch_progress(self._session_email())))
 
         if p == "/api/jobs/generate-status":
             # Polled by the web UI after generate-with-project (and could be
             # polled for any job_id, including one kicked off via Telegram) --
             # {"state": "queued"|"running"|"done"|"failed"|"unknown", "error": str|None}.
-            # "unknown" means nothing has ever been enqueued for this job_id in
-            # this server's lifetime (e.g. it finished before a restart, or was
-            # never queued at all) -- a genuinely different state from "failed".
+            # "unknown" means nothing has ever been enqueued for THIS USER's
+            # generate of this job_id in this server's lifetime (e.g. it
+            # finished before a restart, never queued, or someone else
+            # generated the same shared job -- that's not this status).
             jid = int(qs.get("job_id", ["0"])[0])
+            email = self._session_email()
             with _generate_status_lock:
-                st = dict(_generate_status.get(jid) or {"state": "unknown", "error": None})
+                st = dict(_generate_status.get((email, jid)) or {"state": "unknown", "error": None})
             return self._json(st)
 
         if p == "/api/jobs/detail":
             jid = int(qs.get("id", ["0"])[0])
-            j = jobsdb.jobs_get(jid)
+            email = self._session_email()
+            j = jobsdb.jobs_get(email, jid)
             if not j:
                 return self._json({"error": "no such job"}, 404)
-            j["stale"] = j["llm_score"] is not None and jobsdb.jobs_llm_score_stale(j)
+            j["stale"] = j["llm_score"] is not None and jobsdb.jobs_llm_score_stale(email, j)
             j["llm_missing"] = _parse_json_col(j["llm_missing"])
             j["llm_projects"] = _parse_json_col(j["llm_projects"])
-            return self._json({"job": j, "applications": jobsdb.applications_for_job(jid)})
+            return self._json({"job": j, "applications": jobsdb.applications_for_job(email, jid)})
 
         if p == "/api/applications/list":
-            return self._json({"applications": jobsdb.applications_all()})
+            return self._json({"applications": jobsdb.applications_all(self._session_email())})
 
         if p == "/api/profile/points":
+            email = self._session_email()
             show_all = qs.get("all", ["0"])[0] == "1"
-            points = jobsdb.point_bank_all(active_only=not show_all)
+            points = jobsdb.point_bank_all(email, active_only=not show_all)
             # Keyword+Use+Result rubric, authoring-time half (brag + no bare
             # generic-verb opener) -- surfaced on every real point here so a
             # weak one is visible at a glance in Manage Entries. A
@@ -2291,15 +2405,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"points": points})
 
         if p == "/api/profile/skills":
-            return self._json({"skills": jobsdb.skills_all()})
+            return self._json({"skills": jobsdb.skills_all(self._session_email())})
 
         if p == "/api/profile/fields":
-            return self._json({"profile": jobsdb.profile_all()})
+            return self._json({"profile": jobsdb.profile_all(self._session_email())})
+
+        if p == "/api/session":
+            # The frontend's one source of truth for "what can I do here" --
+            # admin (full access + whitelist control), whitelisted (full
+            # access), or guest (read-only preview, every action blocked
+            # server-side regardless of what the UI shows).
+            email = self._session_email()
+            return self._json({"email": email, "role": _user_role(email)})
+
+        if p == "/api/admin/users":
+            if self._require_admin() is None:
+                return
+            return self._json({"users": jobsdb.users_all()})
 
         if p == "/api/telegram/config":
             # Never echoes the real bot_token back to the browser once saved --
             # only enough to confirm it's set (last 4 chars) and offer "Replace".
-            email = _valid_session_email(self.headers.get("Cookie", ""))
+            email = self._session_email()
             cfg = jobsdb.telegram_config_get(email)
             if not cfg:
                 return self._json({"configured": False})
@@ -2321,10 +2448,12 @@ class Handler(BaseHTTPRequestHandler):
 
         return self._static(p)
 
-    def _jobs_post(self, p, b):
+    def _jobs_post(self, p, b, email):
         if p == "/api/jobs/manual":
             # No regex score computed on add -- queue it and run AI-judge
             # (on this posting or in a batch) to get a real fit score.
+            # Shared postings table -- whoever adds it, everyone whitelisted
+            # can see and score it themselves, same as a fetched posting.
             company, title = b.get("company", "").strip(), b.get("title", "").strip()
             text, url = b.get("text", "").strip(), b.get("url", "").strip()
             location = b.get("location", "").strip()
@@ -2334,7 +2463,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"job_id": jid, "is_new": is_new})
 
         if p == "/api/jobs/queue":
-            jobsdb.jobs_set_status(int(b.get("job_id", 0)), "queued")
+            jobsdb.jobs_set_status(email, int(b.get("job_id", 0)), "queued")
             return self._json({"ok": True})
 
         if p == "/api/jobs/mark-applied":
@@ -2342,10 +2471,10 @@ class Handler(BaseHTTPRequestHandler):
             # touches the generate pipeline at all -- applied on the
             # company's site or LinkedIn with your own resume.
             jid = int(b.get("job_id", 0))
-            if not jobsdb.jobs_get(jid):
+            if not jobsdb.jobs_get(email, jid):
                 return self._json({"error": "no such job"}, 404)
             aid = jobsdb.applications_quick_mark_applied(
-                jid, b.get("via", "other"), b.get("referral_name", ""), b.get("referral_note", ""))
+                email, jid, b.get("via", "other"), b.get("referral_name", ""), b.get("referral_note", ""))
             return self._json({"ok": True, "application_id": aid})
 
         if p == "/api/jobs/refetch":
@@ -2354,7 +2483,8 @@ class Handler(BaseHTTPRequestHandler):
             # explicit action (AI-judge / /api/jobs/llm-backfill) on
             # purpose -- it has a real cost per call. Async -- see
             # _run_fetch_async. Starts the background fetch and returns
-            # immediately; the UI polls /api/jobs/refetch/status.
+            # immediately; the UI polls /api/jobs/refetch/status. Fetches
+            # into the one shared postings table -- not per-user.
             started = _run_fetch_async()
             if not started:
                 return self._json({"error": "A fetch is already running"}, 409)
@@ -2364,24 +2494,24 @@ class Handler(BaseHTTPRequestHandler):
             # The ONLY pre-generation LLM judgment -- fully manual, triggered
             # by this button, never automatically on fetch. Judges any real
             # engineering title (not manager-tier) in India/Bangalore/
-            # Bengaluru that's either never been judged, OR was judged
-            # before the master doc/skills/profile last changed
-            # (jobs_llm_score_stale). Runs the whole eligible set, async --
-            # no per-call cap, see _run_judge_batch. days: same plain
-            # day-count as the list filter, defaults to 14 when not given
-            # at all. The "Clear & re-judge" flow can still explicitly pass
-            # days=0 to deliberately scrub everything, old postings
-            # included.
-            profile, _skill_names, _bullets_text, _skills_line, candidate_years = _jobs_resume_body()
-            point_bank_items = jobsdb.point_bank_all()
+            # Bengaluru that's either never been judged for THIS user, OR
+            # was judged before THIS user's own master doc/skills/profile
+            # last changed (jobs_llm_score_stale). Runs the whole eligible
+            # set, async -- no per-call cap, see _run_judge_batch. days:
+            # same plain day-count as the list filter, defaults to 14 when
+            # not given at all. The "Clear & re-judge" flow can still
+            # explicitly pass days=0 to deliberately scrub everything, old
+            # postings included.
+            profile, _skill_names, _bullets_text, _skills_line, candidate_years = _jobs_resume_body(email)
+            point_bank_items = jobsdb.point_bank_all(email)
             date_cutoff = _days_cutoff(b.get("days"), default=14)
-            candidates = [j for j in jobsdb.jobs_list()
+            candidates = [j for j in jobsdb.jobs_list(email)
                           if jobs_ats.is_likely_engineering_title(j["title"])
                           and jobs_ats.title_seniority_tier(j["title"]) != "manager"
-                          and jobsdb.jobs_llm_score_stale(j)
+                          and jobsdb.jobs_llm_score_stale(email, j)
                           and jobs_ats.is_target_location(j["location"], j["description_raw"])
                           and (date_cutoff is None or j["fetched_ts"] >= date_cutoff)]
-            started = _run_judge_batch(candidates, profile, point_bank_items, candidate_years)
+            started = _run_judge_batch(email, candidates, profile, point_bank_items, candidate_years)
             if not started:
                 return self._json({"error": "AI-judge is already running"}, 409)
             return self._json({"started": True, "candidates": len(candidates)})
@@ -2391,15 +2521,15 @@ class Handler(BaseHTTPRequestHandler):
             # changed and only one posting's score needs to catch up, not
             # a whole batch re-spend. Synchronous: one LLM call.
             jid = int(b.get("job_id", 0))
-            job = jobsdb.jobs_get(jid)
+            job = jobsdb.jobs_get(email, jid)
             if not job:
                 return self._json({"error": "no such job"}, 404)
-            profile, _skill_names, _bullets_text, _skills_line, candidate_years = _jobs_resume_body()
-            ok, reason = _score_only(job, profile, jobsdb.point_bank_all(), candidate_years,
+            profile, _skill_names, _bullets_text, _skills_line, candidate_years = _jobs_resume_body(email)
+            ok, reason = _score_only(email, job, profile, jobsdb.point_bank_all(email), candidate_years,
                                       tuning_key="rescore_single")
             if not ok:
                 return self._json({"error": reason}, 500)
-            fresh = jobsdb.jobs_get(jid)
+            fresh = jobsdb.jobs_get(email, jid)
             fresh["llm_missing"] = _parse_json_col(fresh["llm_missing"])
             fresh["llm_projects"] = _parse_json_col(fresh["llm_projects"])
             return self._json({"job": fresh})
@@ -2412,10 +2542,10 @@ class Handler(BaseHTTPRequestHandler):
             job_ids = [int(x) for x in b.get("job_ids", [])]
             if not job_ids:
                 return self._json({"error": "no job_ids given"}, 400)
-            profile, _skill_names, _bullets_text, _skills_line, candidate_years = _jobs_resume_body()
-            point_bank_items = jobsdb.point_bank_all()
+            profile, _skill_names, _bullets_text, _skills_line, candidate_years = _jobs_resume_body(email)
+            point_bank_items = jobsdb.point_bank_all(email)
             candidates = [{"id": jid} for jid in job_ids]
-            started = _run_judge_batch(candidates, profile, point_bank_items, candidate_years)
+            started = _run_judge_batch(email, candidates, profile, point_bank_items, candidate_years)
             if not started:
                 return self._json({"error": "AI-judge is already running"}, 409)
             return self._json({"started": True, "candidates": len(candidates)})
@@ -2434,26 +2564,27 @@ class Handler(BaseHTTPRequestHandler):
             # frontend polls /api/jobs/generate-status for this job_id.
             jid = int(b.get("job_id", 0))
             project_ids = [int(x) for x in b.get("project_ids", [])]
-            state = _enqueue_generate(jid, forced_project_ids=project_ids)
+            state = _enqueue_generate(email, jid, forced_project_ids=project_ids)
             if state == "no_such_job":
                 return self._json({"error": "no such job"}, 404)
             return self._json({"state": state})
 
         if p == "/api/jobs/clear-llm-scores":
-            # Explicit "force reload" -- wipes AI scores so the next
-            # AI-judge run re-checks them from scratch.
+            # Explicit "force reload" -- wipes THIS user's own AI scores so
+            # their next AI-judge run re-checks them from scratch. Another
+            # user's scores for the same shared postings are untouched.
             date_cutoff = _days_cutoff(b.get("days"))
-            n = jobsdb.jobs_clear_llm_scores(date_cutoff=date_cutoff)
+            n = jobsdb.jobs_clear_llm_scores(email, date_cutoff=date_cutoff)
             return self._json({"cleared": n})
 
         if p == "/api/jobs/generate-queued":
             # The real fix for "I queued it and nothing happened". Drafts +
-            # renders every job currently status='queued', async (see
-            # _run_generate_batch); each one costs three real Zai calls now
-            # (score requirements, select+word the content, then draft the
-            # summary/cover letter prose).
-            candidates = [j for j in jobsdb.jobs_list() if j["status"] == "queued"]
-            started = _run_generate_batch(candidates)
+            # renders every job THIS user currently has status='queued',
+            # async (see _run_generate_batch); each one costs three real
+            # Zai calls now (score requirements, select+word the content,
+            # then draft the summary/cover letter prose).
+            candidates = [j for j in jobsdb.jobs_list(email) if j["status"] == "queued"]
+            started = _run_generate_batch(email, candidates)
             if not started:
                 return self._json({"error": "A generate batch is already running"}, 409)
             return self._json({"started": True, "candidates": len(candidates)})
@@ -2461,9 +2592,10 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/jobs/generate":          # posted only by Claude, via curl -- the
             # resume/cover letter text is authored per job, never auto-templated.
             # selection (content choice + score) is likewise supplied by the
-            # caller here -- this endpoint never calls an LLM itself.
+            # caller here -- this endpoint never calls an LLM itself. Builds
+            # from the logged-in caller's own master doc (user_email).
             with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-                json.dump({"job_id": b.get("job_id"), "summary": b.get("summary", ""),
+                json.dump({"job_id": b.get("job_id"), "user_email": email, "summary": b.get("summary", ""),
                            "cover_letter_body": b.get("cover_letter_body", ""),
                            "selection": b.get("selection", {})}, f)
                 req_path = f.name
@@ -2484,13 +2616,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": f"bad generate_cli output: {out.stdout} {out.stderr}"}, 500)
 
         if p == "/api/applications/mark-applied":
-            jobsdb.applications_mark_applied(int(b.get("app_id", 0)), b.get("via", "other"),
+            jobsdb.applications_mark_applied(email, int(b.get("app_id", 0)), b.get("via", "other"),
                                               referral_name=b.get("referral_name", ""),
                                               referral_note=b.get("referral_note", ""))
             return self._json({"ok": True})
 
         if p == "/api/applications/add-status":
-            jobsdb.applications_add_status_event(int(b.get("app_id", 0)), b.get("status", ""),
+            jobsdb.applications_add_status_event(email, int(b.get("app_id", 0)), b.get("status", ""),
                                                   note=b.get("note", ""))
             return self._json({"ok": True})
 
@@ -2514,7 +2646,7 @@ class Handler(BaseHTTPRequestHandler):
             # Scans every company at once, returns only the ones that
             # actually have something to combine.
             def _tidy_one(company, role):
-                existing = [pt for pt in jobsdb.point_bank_all(active_only=True)
+                existing = [pt for pt in jobsdb.point_bank_all(email, active_only=True)
                             if pt["company"] == company and not pt["text"].lstrip().startswith("[")]
                 existing_texts = [pt["text"] for pt in existing]
                 result = _zai_tidy_company(company, role, existing_texts)
@@ -2527,7 +2659,7 @@ class Handler(BaseHTTPRequestHandler):
                         "current_texts": existing_texts, "proposed_texts": result["points"],
                         "notes": result["notes"]}
 
-            all_points = [pt for pt in jobsdb.point_bank_all(active_only=True)
+            all_points = [pt for pt in jobsdb.point_bank_all(email, active_only=True)
                           if not pt["text"].lstrip().startswith("[")]
             by_company = {}
             for pt in all_points:
@@ -2537,11 +2669,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if p == "/api/profile/points/update":
             quality = jobs_ats.check_bullet_brag(b.get("text", ""))
-            jobsdb.point_bank_update_text(int(b.get("id", 0)), b.get("text", ""))
+            jobsdb.point_bank_update_text(email, int(b.get("id", 0)), b.get("text", ""))
             return self._json({"ok": True, "quality_warning": None if quality["ok"] else quality})
 
         if p == "/api/profile/points/toggle":
-            jobsdb.point_bank_set_active(int(b.get("id", 0)), bool(b.get("active", True)))
+            jobsdb.point_bank_set_active(email, int(b.get("id", 0)), bool(b.get("active", True)))
             return self._json({"ok": True})
 
         if p == "/api/profile/points/tidy-commit":
@@ -2562,7 +2694,7 @@ class Handler(BaseHTTPRequestHandler):
                 company = entry.get("company", "")
                 role = entry.get("role", "")
                 accepted_texts = [str(t).strip() for t in entry.get("texts", []) if str(t).strip()]
-                existing = [pt for pt in jobsdb.point_bank_all(active_only=True) if pt["company"] == company]
+                existing = [pt for pt in jobsdb.point_bank_all(email, active_only=True) if pt["company"] == company]
                 existing_by_text = {}
                 for pt in existing:
                     existing_by_text.setdefault(pt["text"], pt)
@@ -2578,30 +2710,30 @@ class Handler(BaseHTTPRequestHandler):
                 start = min(starts) if starts else ""
                 end = None if (not ends or any(not e for e in ends)) else max(ends)
                 for text in new_texts:
-                    jobsdb.point_bank_add(company, role, start, end, text, tags=tags, entry_type=entry_type,
+                    jobsdb.point_bank_add(email, company, role, start, end, text, tags=tags, entry_type=entry_type,
                                            source_note="tidied/merged via Manage entries")
                 for pt in retired:
-                    jobsdb.point_bank_set_active(pt["id"], False)
+                    jobsdb.point_bank_set_active(email, pt["id"], False)
                 updated += 1
             return self._json({"companies_updated": updated})
 
         if p == "/api/profile/skills/add":
-            jobsdb.skills_add(b.get("name", ""), b.get("category", "Other"))
+            jobsdb.skills_add(email, b.get("name", ""), b.get("category", "Other"))
             return self._json({"ok": True})
 
         if p == "/api/profile/fields/set":
-            jobsdb.profile_set(b.get("key", ""), b.get("value", ""))
+            jobsdb.profile_set(email, b.get("key", ""), b.get("value", ""))
             return self._json({"ok": True})
 
         if p == "/api/profile/extract":
-            return self._profile_extract(b)
+            return self._profile_extract(b, email)
 
         if p == "/api/profile/extract/commit":
-            return self._profile_extract_commit(b)
+            return self._profile_extract_commit(b, email)
 
         self.send_error(404)
 
-    def _profile_extract(self, b):
+    def _profile_extract(self, b, email):
         """Upload OR pasted text -> extract -> propose. Never writes to the
         DB -- returns the proposal for the UI to show as an editable review
         list, each point marked with whether it looks like a near-duplicate
@@ -2631,7 +2763,7 @@ class Handler(BaseHTTPRequestHandler):
         if not text.strip():
             return self._json({"error": "no text found -- paste some text or choose a different file"}, 400)
 
-        existing = jobsdb.point_bank_all(active_only=False)
+        existing = jobsdb.point_bank_all(email, active_only=False)
         known_companies = sorted({p["company"] for p in existing})
         existing_points_text = "\n".join(f"- [{p['company']}] {p['text']}" for p in existing)
         proposal, err = _zai_extract_profile(text, known_companies, existing_points_text)
@@ -2642,12 +2774,12 @@ class Handler(BaseHTTPRequestHandler):
         # difflib against what's actually on file, not just what the model
         # noticed. Marks, doesn't drop: the user still sees and decides.
         for pt in proposal.get("points", []):
-            match, ratio = jobsdb.point_bank_find_similar(pt.get("text", ""))
+            match, ratio = jobsdb.point_bank_find_similar(email, pt.get("text", ""))
             pt["likely_duplicate"] = match is not None
             pt["duplicate_of_text"] = match["text"] if match else None
         return self._json({"proposal": proposal})
 
-    def _profile_extract_commit(self, b):
+    def _profile_extract_commit(self, b, email):
         """Writes exactly the points/skills the UI sends back -- after the
         user has reviewed, edited, and deselected whatever they didn't want.
         Still re-checks each point against the point bank right before
@@ -2656,19 +2788,19 @@ class Handler(BaseHTTPRequestHandler):
         skills = b.get("skills", [])
         added_points, skipped_dupes, added_skills = 0, 0, 0
         for p in points:
-            match, _ = jobsdb.point_bank_find_similar(p.get("text", ""))
+            match, _ = jobsdb.point_bank_find_similar(email, p.get("text", ""))
             if match:
                 skipped_dupes += 1
                 continue
             tags = p.get("tags") or []
             if isinstance(tags, str):
                 tags = [t.strip() for t in tags.split(",") if t.strip()]
-            jobsdb.point_bank_add(p.get("company", ""), p.get("role", ""), p.get("start_date", ""),
+            jobsdb.point_bank_add(email, p.get("company", ""), p.get("role", ""), p.get("start_date", ""),
                                    p.get("end_date") or None, p.get("text", ""), tags=tags,
                                    source_note="uploaded + extracted via Profile UI")
             added_points += 1
         for s in skills:
-            jobsdb.skills_add(s.get("name", ""), s.get("category", "Other"))
+            jobsdb.skills_add(email, s.get("name", ""), s.get("category", "Other"))
             added_skills += 1
         return self._json({"added_points": added_points, "skipped_dupes": skipped_dupes,
                             "added_skills": added_skills})
@@ -2682,17 +2814,46 @@ class Handler(BaseHTTPRequestHandler):
 
         b = self._body()
 
+        if p.startswith("/api/admin/"):
+            return self._admin_post(p, b)
+
+        # Every other POST route is a real action (add/edit/generate/fetch/
+        # mark-applied/telegram config) -- all gated on whitelisted-or-admin.
+        # A guest's session is real (Google confirmed who they are) but
+        # _require_whitelisted writes the 403 itself and returns None, so
+        # nothing past this point ever runs for them.
+        email = self._require_whitelisted()
+        if email is None:
+            return
+
         if p.startswith("/api/jobs/") or p.startswith("/api/applications/") or p.startswith("/api/profile/"):
-            return self._jobs_post(p, b)
+            return self._jobs_post(p, b, email)
 
         if p.startswith("/api/telegram/"):
-            return self._telegram_post(p, b)
+            return self._telegram_post(p, b, email)
 
         self.send_error(404)
 
-    def _telegram_post(self, p, b):
-        email = _valid_session_email(self.headers.get("Cookie", ""))
+    def _admin_post(self, p, b):
+        email = self._require_admin()
+        if email is None:
+            return
 
+        if p == "/api/admin/users/add":
+            new_email = (b.get("email") or "").strip().lower()
+            if not new_email or "@" not in new_email:
+                return self._json({"error": "a real email address is required"}, 400)
+            jobsdb.users_add(new_email)
+            return self._json({"users": jobsdb.users_all()})
+
+        if p == "/api/admin/users/remove":
+            target = (b.get("email") or "").strip().lower()
+            jobsdb.users_remove(target)
+            return self._json({"users": jobsdb.users_all()})
+
+        self.send_error(404)
+
+    def _telegram_post(self, p, b, email):
         if p == "/api/telegram/config":
             bot_token, chat_id = b.get("bot_token", "").strip(), b.get("chat_id", "").strip()
             if not bot_token or not chat_id:

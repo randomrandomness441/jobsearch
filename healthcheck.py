@@ -59,11 +59,11 @@ def check_db_integrity():
 
 
 def check_point_bank():
-    n = len(db.point_bank_all())
+    n = len(db.point_bank_all(db.ADMIN_EMAIL))
     # Real point bank has 50+ rows -- a handful would mean a fresh/empty
     # clone's db got used by mistake (the exact VPS incident this guards
     # against: a git clone has no data/jobsearch.db at all).
-    return n >= 20, f"{n} point_bank rows"
+    return n >= 20, f"{n} point_bank rows (admin: {db.ADMIN_EMAIL})"
 
 
 def check_binaries():
@@ -79,17 +79,25 @@ def check_zai_key():
 
 
 def check_telegram_bot(send_test=False):
-    if not notify_telegram.TELEGRAM_BOT_TOKEN or not notify_telegram.TELEGRAM_CHAT_ID:
-        return False, "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set"
-    ok, err = notify_telegram._call("getMe", {})
-    if not ok:
-        return False, f"getMe failed: {err}"
+    # Per-user telegram_config (see server.py's Profile-tab box) takes priority
+    # over the old env-var bot -- the admin's own row there is what poll_and_notify.py
+    # actually sends through now; fall back to the env vars for a from-scratch
+    # deploy that hasn't filled in the Profile tab yet.
+    cfg = db.telegram_config_get(db.ADMIN_EMAIL)
+    token = cfg["bot_token"] if cfg else notify_telegram.TELEGRAM_BOT_TOKEN
+    chat_id = cfg["chat_id"] if cfg else notify_telegram.TELEGRAM_CHAT_ID
+    if not token or not chat_id:
+        return False, "no Telegram config for the admin (neither the Profile-tab table nor TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID env vars)"
+    result, err = notify_telegram._call("getMe", {}, bot_token=token)
+    if err or not result.get("ok"):
+        return False, f"getMe failed: {err or result}"
     if send_test:
-        ok2, err2 = notify_telegram._call(
-            "sendMessage", {"chat_id": notify_telegram.TELEGRAM_CHAT_ID,
-                             "text": f"jobsearch healthcheck OK -- {time.strftime('%Y-%m-%d %H:%M')}"})
-        if not ok2:
-            return False, f"bot token valid but sendMessage failed: {err2}"
+        result2, err2 = notify_telegram._call(
+            "sendMessage", {"chat_id": chat_id,
+                             "text": f"jobsearch healthcheck OK -- {time.strftime('%Y-%m-%d %H:%M')}"},
+            bot_token=token)
+        if err2 or not result2.get("ok"):
+            return False, f"bot token valid but sendMessage failed: {err2 or result2}"
         return True, "bot token valid, test message sent"
     return True, "bot token valid (getMe ok) -- pass --notify to also send a real test message"
 
@@ -108,7 +116,7 @@ def check_cron_registered():
 
 
 def check_latest_resume_on_disk():
-    apps = db.applications_all()
+    apps = db.applications_all(db.ADMIN_EMAIL)
     if not apps:
         return True, "no applications generated yet -- nothing to check"
     latest = apps[0]
@@ -123,13 +131,13 @@ def check_latest_resume_on_disk():
 
 
 def check_idempotent_regenerate():
-    apps = db.applications_all()
+    apps = db.applications_all(db.ADMIN_EMAIL)
     if not apps:
         return True, "no generated applications yet -- nothing to check"
-    job = db.jobs_get(apps[0]["job_id"])
+    job = db.jobs_get(db.ADMIN_EMAIL, apps[0]["job_id"])
     if job is None:
         return False, "most recent application's job no longer exists"
-    needs = S._needs_regenerate(job)
+    needs = S._needs_regenerate(db.ADMIN_EMAIL, job)
     if needs:
         return True, "job was rescored since last generation -- a regenerate is correctly expected, not a bug"
     return True, "already-generated, not-rescored job correctly resolves to a no-op (won't waste an LLM call)"

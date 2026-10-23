@@ -73,33 +73,43 @@ def fetch_new_postings():
 
 
 def score_eligible():
-    """Same filter as the AI-judge button: real engineering title, not
-    manager-tier, target location, never-judged or judged-before-the-
-    master-doc-last-changed, fetched within the last 14 days."""
-    profile, skill_names, _bullets_text, _skills_line, candidate_years = S._jobs_resume_body()
-    point_bank_items = jobsdb.point_bank_all()
+    """Same filter as the AI-judge button, run once per whitelisted user:
+    real engineering title, not manager-tier, target location, never-
+    judged-for-THIS-user or judged-before-THIS-user's-own-master-doc-
+    last-changed, fetched within the last 14 days. One shared jobs pool,
+    but each user's own score on it -- a cron tick scores every
+    whitelisted user's view of the same postings, not just the admin's."""
     date_cutoff = S._days_cutoff(None, default=14)
-    candidates = [j for j in jobsdb.jobs_list()
-                  if jobs_ats.is_likely_engineering_title(j["title"])
-                  and jobs_ats.title_seniority_tier(j["title"]) != "manager"
-                  and jobsdb.jobs_llm_score_stale(j)
-                  and jobs_ats.is_target_location(j["location"], j["description_raw"])
-                  and (date_cutoff is None or j["fetched_ts"] >= date_cutoff)]
-    print(f"[poll] {len(candidates)} eligible for scoring")
-    failed = 0
-    for j in candidates:
-        ok, reason = S._score_only(j, profile, point_bank_items, candidate_years, tuning_key="judge_batch")
-        if not ok:
-            failed += 1
-            print(f"[poll] score failed for job {j['id']} ({j['title']} @ {j['company']}): {reason}",
-                  file=sys.stderr)
-    print(f"[poll] scored {len(candidates) - failed}/{len(candidates)}")
+    for u in jobsdb.users_all():
+        email = u["email"]
+        profile, skill_names, _bullets_text, _skills_line, candidate_years = S._jobs_resume_body(email)
+        point_bank_items = jobsdb.point_bank_all(email)
+        candidates = [j for j in jobsdb.jobs_list(email)
+                      if jobs_ats.is_likely_engineering_title(j["title"])
+                      and jobs_ats.title_seniority_tier(j["title"]) != "manager"
+                      and jobsdb.jobs_llm_score_stale(email, j)
+                      and jobs_ats.is_target_location(j["location"], j["description_raw"])
+                      and (date_cutoff is None or j["fetched_ts"] >= date_cutoff)]
+        print(f"[poll] {email}: {len(candidates)} eligible for scoring")
+        failed = 0
+        for j in candidates:
+            ok, reason = S._score_only(email, j, profile, point_bank_items, candidate_years,
+                                        tuning_key="judge_batch")
+            if not ok:
+                failed += 1
+                print(f"[poll] score failed for {email}, job {j['id']} ({j['title']} @ {j['company']}): {reason}",
+                      file=sys.stderr)
+        print(f"[poll] {email}: scored {len(candidates) - failed}/{len(candidates)}")
 
 
 def notify_new_postings(run_started_ts):
-    """Notify for EVERY scored posting fetched in THIS cron tick -- no score
-    threshold anymore (was NOTIFY_THRESHOLD = 80; removed on request: every
-    posting should produce a notification now, not just ones scoring 80+).
+    """Notify every whitelisted user, through THEIR OWN Telegram bot, for
+    EVERY scored posting fetched in THIS cron tick -- no score threshold
+    (was NOTIFY_THRESHOLD = 80; removed on request: every posting should
+    produce a notification now, not just ones scoring 80+). A user with no
+    telegram_config saved yet is skipped (logged, not an error) -- they
+    just use the website instead until they fill in the Profile tab's
+    Telegram box.
 
     Still gated on "genuinely fetched in this run" (fetched_ts >=
     run_started_ts, captured before fetch_new_postings() ran), not just
@@ -114,33 +124,40 @@ def notify_new_postings(run_started_ts):
     threshold, so this gate stays.
 
     Still gated on "not already notified" -- same dedup as before, a
-    posting only ever gets one notification per genuine fetch.
+    posting only ever gets one notification per genuine fetch, per user.
     """
-    sent, skipped_old = 0, 0
-    for j in jobsdb.jobs_list():
-        if j["llm_score"] is None:
+    for u in jobsdb.users_all():
+        email = u["email"]
+        cfg = jobsdb.telegram_config_get(email)
+        if cfg is None:
+            print(f"[poll] {email}: no Telegram config saved -- skipping notifications for this user")
             continue
-        if j["notified_ts"] is not None:
-            continue
-        if j["fetched_ts"] < run_started_ts:
-            # Scored in this tick but fetched earlier (a rescore, not a fresh
-            # fetch) -- don't alert. Not marked notified either, so it's still
-            # eligible once a genuine future re-fetch of this exact posting
-            # updates it.
-            skipped_old += 1
-            continue
-        sig = S._sign_job_id(j["id"])
-        generate_url = f"{BASE_URL}/api/jobs/generate-link?job_id={j['id']}&sig={sig}"
-        view_url = f"{BASE_URL}/api/jobs/view-details?job_id={j['id']}&sig={sig}"
-        ok, err = notify_telegram.send_job_alert(j, generate_url, view_url)
-        if ok:
-            jobsdb.jobs_mark_notified(j["id"])
-            sent += 1
-            print(f"[poll] notified: {j['title']} @ {j['company']} (score {j['llm_score']:.0f})")
-        else:
-            print(f"[poll] notify FAILED for job {j['id']}: {err}", file=sys.stderr)
-    print(f"[poll] {sent} notification(s) sent, {skipped_old} skipped "
-          f"(scored but not fetched in this run)")
+        sent, skipped_old = 0, 0
+        for j in jobsdb.jobs_list(email):
+            if j["llm_score"] is None:
+                continue
+            if j["notified_ts"] is not None:
+                continue
+            if j["fetched_ts"] < run_started_ts:
+                # Scored in this tick but fetched earlier (a rescore, not a fresh
+                # fetch) -- don't alert. Not marked notified either, so it's still
+                # eligible once a genuine future re-fetch of this exact posting
+                # updates it.
+                skipped_old += 1
+                continue
+            sig = S._sign_job_user(email, j["id"])
+            generate_url = f"{BASE_URL}/api/jobs/generate-link?job_id={j['id']}&user={email}&sig={sig}"
+            view_url = f"{BASE_URL}/api/jobs/view-details?job_id={j['id']}&user={email}&sig={sig}"
+            ok, err = notify_telegram.send_job_alert(j, generate_url, view_url,
+                                                       bot_token=cfg["bot_token"], chat_id=cfg["chat_id"])
+            if ok:
+                jobsdb.jobs_mark_notified(email, j["id"])
+                sent += 1
+                print(f"[poll] {email}: notified: {j['title']} @ {j['company']} (score {j['llm_score']:.0f})")
+            else:
+                print(f"[poll] {email}: notify FAILED for job {j['id']}: {err}", file=sys.stderr)
+        print(f"[poll] {email}: {sent} notification(s) sent, {skipped_old} skipped "
+              f"(scored but not fetched in this run)")
 
 
 def main():

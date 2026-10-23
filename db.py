@@ -1,4 +1,4 @@
-"""State for the job application system. Single user, SQLite, no ORM.
+"""State for the job application system. Multi-user, SQLite, no ORM.
 
 Same idiom as the C++ prep platform's db.py: plain stdlib sqlite3, no
 framework, no ORM. Two things live here that don't in a normal CRUD app:
@@ -10,6 +10,16 @@ framework, no ORM. Two things live here that don't in a normal CRUD app:
     applications the record of what was actually generated and where it
                  landed on disk, so nothing generated is ever orphaned from
                  its own folder.
+
+Multi-user shape: `jobs` (the fetched postings) is the one table shared by
+everyone -- public listings, not private data, so one fetch serves every
+user. Everything else is keyed by user_email: each person's own
+point_bank/skills/profile, their own job_user_state (score/status/
+notified, per job), their own applications. See `users` for who's allowed
+to use the app at all (admin-managed whitelist; a confirmed Google login
+that isn't on it is a guest -- identified, but with no rows anywhere in
+the per-user tables, so they see the shared postings with nothing
+personalized and no real actions).
 """
 
 import difflib
@@ -39,9 +49,31 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "jobsearch.db")
 
+# Only used once, by _migrate(), to seed the first admin and to decide whose
+# email pre-existing (pre-multi-user) rows belong to -- every table that used
+# to be implicitly "the one candidate" becomes per-user here, and existing
+# data has to land under SOMEONE's email rather than vanish. Same env var
+# the old single-user login gate used, so a deploy that already has it set
+# needs no new configuration.
+ADMIN_EMAIL = os.environ.get("ALLOWED_LOGIN_EMAIL", "") or "admin@local"
+
 SCHEMA = """
+-- Multi-user gate: who's allowed to actually use the app. 'admin' (just
+-- you -- seeded from ALLOWED_LOGIN_EMAIL, the env var that used to be the
+-- entire auth system) can manage this list; 'whitelisted' is anyone the
+-- admin added. Anyone who logs in via Google but ISN'T in this table is
+-- a guest -- identified, but every private table below is keyed by
+-- email, so a guest simply has no rows anywhere and sees the shared job
+-- postings with nothing personalized, no real actions.
+CREATE TABLE IF NOT EXISTS users (
+    email    TEXT PRIMARY KEY,
+    role     TEXT NOT NULL DEFAULT 'whitelisted',  -- admin|whitelisted
+    added_ts REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS point_bank (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_email  TEXT NOT NULL,         -- whose master resume this belongs to
     company     TEXT NOT NULL,
     role        TEXT NOT NULL,
     start_date  TEXT NOT NULL,
@@ -54,16 +86,25 @@ CREATE TABLE IF NOT EXISTS point_bank (
 );
 
 CREATE TABLE IF NOT EXISTS skills (
-    name     TEXT PRIMARY KEY,
-    category TEXT NOT NULL,
-    active   INTEGER DEFAULT 1
+    user_email TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    category   TEXT NOT NULL,
+    active     INTEGER DEFAULT 1,
+    PRIMARY KEY (user_email, name)
 );
 
 CREATE TABLE IF NOT EXISTS profile (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
+    user_email TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    PRIMARY KEY (user_email, key)
 );
 
+-- Shared across every user -- these are public job listings pulled from
+-- company ATS feeds, not private data, so one fetch serves everyone
+-- instead of each user redundantly hitting the same APIs. What's
+-- personal (score, status, notified) lives in job_user_state below, one
+-- row per (user, job) instead of columns on this table.
 CREATE TABLE IF NOT EXISTS jobs (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     source           TEXT NOT NULL,          -- greenhouse|lever|pinloop|manual
@@ -74,11 +115,31 @@ CREATE TABLE IF NOT EXISTS jobs (
     fetched_ts       REAL NOT NULL,
     match_score      REAL,
     match_reason     TEXT DEFAULT '',
-    status           TEXT NOT NULL DEFAULT 'new'   -- new|shortlisted|generated|applied|skipped
+    content_hash     TEXT DEFAULT '',
+    location         TEXT DEFAULT '',
+    posted_ts        REAL
+);
+
+-- One user's relationship to one shared posting: their own AI-judge
+-- score, their own queued/applied status, their own notification state.
+-- Two users looking at the same job_id never see each other's row here.
+CREATE TABLE IF NOT EXISTS job_user_state (
+    user_email       TEXT NOT NULL,
+    job_id           INTEGER NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'new',  -- new|queued|applied|skipped
+    llm_score        REAL,
+    llm_reason       TEXT DEFAULT '',
+    llm_judged_ts    REAL,
+    llm_missing      TEXT DEFAULT '[]',
+    llm_projects     TEXT DEFAULT '[]',
+    llm_requirements TEXT DEFAULT '[]',
+    notified_ts      REAL,
+    PRIMARY KEY (user_email, job_id)
 );
 
 CREATE TABLE IF NOT EXISTS applications (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_email        TEXT NOT NULL,         -- whose generated materials these are
     job_id            INTEGER NOT NULL,
     resume_path       TEXT,
     cover_letter_path TEXT,
@@ -97,22 +158,22 @@ CREATE TABLE IF NOT EXISTS applications (
 -- A batch's live progress used to live only in server.py's process memory
 -- -- a real restart (deploying a code change, say) wiped it blank with no
 -- way to tell "nothing's ever run" from "something ran and finished" from
--- "something was running when the server went down". Single row, always
--- id=1 -- this isn't a log, just the one current/last-known state, same
--- shape as the in-memory dict it replaces.
+-- "something was running when the server went down". One row per user --
+-- each person's own AI-judge batch run, not a shared single row.
 CREATE TABLE IF NOT EXISTS judge_progress (
-    id   INTEGER PRIMARY KEY CHECK (id = 1),
-    data TEXT NOT NULL
+    user_email TEXT PRIMARY KEY,
+    data       TEXT NOT NULL
 );
 
--- The Gaps tab's cluster result, same single-row shape as judge_progress
+-- The Gaps tab's cluster result, same per-user shape as judge_progress
 -- above -- was recomputing with a real LLM call every single time the tab
 -- was opened, not just on an explicit Refresh. This is that cache: the
 -- tab reads it instantly, and only the Refresh button (or a scoped
--- rejudge finishing) writes a fresh one.
+-- rejudge finishing) writes a fresh one. Per user, since it's built from
+-- that user's own point bank and their own job scores.
 CREATE TABLE IF NOT EXISTS gap_clusters (
-    id   INTEGER PRIMARY KEY CHECK (id = 1),
-    data TEXT NOT NULL
+    user_email TEXT PRIMARY KEY,
+    data       TEXT NOT NULL
 );
 
 -- One Telegram bot/chat per user, keyed by their login email -- the
@@ -131,23 +192,18 @@ CREATE TABLE IF NOT EXISTS telegram_config (
 
 def _migrate(con):
     """Add columns to tables that existed before this field did. Idempotent:
-    checks PRAGMA table_info first, never re-adds a column that's there."""
+    checks PRAGMA table_info first, never re-adds a column that's there.
+
+    Also the one-time multi-user cutover: every table that used to be
+    implicitly "the one candidate" (point_bank, skills, profile,
+    applications, judge_progress, gap_clusters) gets keyed by user_email,
+    and whatever existed before this ran is attributed to ADMIN_EMAIL --
+    nothing is dropped, nothing silently becomes invisible."""
     cols = {r[1] for r in con.execute("PRAGMA table_info(jobs)").fetchall()}
     if "content_hash" not in cols:
         con.execute("ALTER TABLE jobs ADD COLUMN content_hash TEXT DEFAULT ''")
-    if "llm_score" not in cols:
-        # second-pass judgment from an LLM (Zai), only computed for postings
-        # that already cleared the free regex filter -- NULL until that
-        # runs, and stays NULL forever for postings that never qualify.
-        con.execute("ALTER TABLE jobs ADD COLUMN llm_score REAL")
-        con.execute("ALTER TABLE jobs ADD COLUMN llm_reason TEXT DEFAULT ''")
     if "location" not in cols:
         con.execute("ALTER TABLE jobs ADD COLUMN location TEXT DEFAULT ''")
-    if "llm_judged_ts" not in cols:
-        # when the LLM score was actually computed -- compared against
-        # profile_version_ts() to decide if a posting needs re-judging
-        # (the candidate's own data changed since it was last scored).
-        con.execute("ALTER TABLE jobs ADD COLUMN llm_judged_ts REAL")
     if "posted_ts" not in cols:
         # the posting's OWN publish date, straight from the source ATS
         # (Greenhouse first_published / Lever createdAt / Ashby publishedAt)
@@ -156,37 +212,16 @@ def _migrate(con):
         # safe for that since companies bump old listings without them being
         # new.
         con.execute("ALTER TABLE jobs ADD COLUMN posted_ts REAL")
-    if "llm_missing" not in cols:
-        # JSON [{gap, why, example}, ...] -- the same real-gap signal
-        # _zai_generate_and_score produces at actual generation time, also
-        # stored here when that same judge runs in score-only mode (AI-judge,
-        # single-job rescore), so the gap is visible before ever generating
-        # a resume, not just after.
-        con.execute("ALTER TABLE jobs ADD COLUMN llm_missing TEXT DEFAULT '[]'")
-    if "llm_projects" not in cols:
-        # JSON [{row_id, worth_including, reason}, ...] -- the project
-        # advisory from the same call, visible before ever generating a
-        # resume so "is this project worth adding" is answered up front,
-        # not only discovered after a generate.
-        con.execute("ALTER TABLE jobs ADD COLUMN llm_projects TEXT DEFAULT '[]'")
-    if "notified_ts" not in cols:
-        # When the poll loop last sent a crossed-threshold notification for
-        # this job -- NULL until sent, so a job already notified isn't sent
-        # again every 10-minute tick. Cleared back to NULL if llm_score
-        # later drops below the notify threshold, so a genuine re-crossing
-        # (master doc changed, JD edited) notifies again rather than being
-        # silently swallowed forever by the first notification.
-        con.execute("ALTER TABLE jobs ADD COLUMN notified_ts REAL")
-    if "llm_requirements" not in cols:
-        # JSON [{requirement, importance, presence, depth, evidence_row_id,
-        # weight, earned}, ...] -- Call 1's own per-requirement breakdown,
-        # previously only ever held transiently in memory during a generate
-        # and never persisted. Needed so a generate can REUSE a non-stale
-        # AI-judge score instead of silently re-running Call 1 from scratch
-        # (a second, independent, non-deterministic LLM call) -- that gap
-        # was producing two different "ATS scores" for the same posting:
-        # one on the postings list, a different one in ats_estimate.md.
-        con.execute("ALTER TABLE jobs ADD COLUMN llm_requirements TEXT DEFAULT '[]'")
+    # llm_score/llm_reason/llm_judged_ts/llm_missing/llm_projects/
+    # llm_requirements/notified_ts/status used to live as columns on jobs --
+    # moved to job_user_state (one row per user per job) since scoring,
+    # status, and notification state are now personal to each user, not a
+    # property of the shared posting. A pre-existing DB still HAS these
+    # columns (never dropped -- ALTER TABLE DROP COLUMN on a live prod SQLite
+    # file is a real risk for zero functional benefit); they're just dead
+    # weight now, backfilled into job_user_state once below, then ignored by
+    # every function in this file going forward.
+    had_old_scoring_cols = "llm_score" in cols
 
     cols = {r[1] for r in con.execute("PRAGMA table_info(point_bank)").fetchall()}
     if "entry_type" not in cols:
@@ -195,6 +230,9 @@ def _migrate(con):
         # short tagline/stack line, same columns, no new ones needed.
         # Existing rows default to 'role', unaffected.
         con.execute("ALTER TABLE point_bank ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'role'")
+    if "user_email" not in cols:
+        con.execute("ALTER TABLE point_bank ADD COLUMN user_email TEXT NOT NULL DEFAULT ''")
+        con.execute("UPDATE point_bank SET user_email=? WHERE user_email=''", (ADMIN_EMAIL,))
 
     cols = {r[1] for r in con.execute("PRAGMA table_info(applications)").fetchall()}
     for name, ddl in [
@@ -207,6 +245,65 @@ def _migrate(con):
     ]:
         if name not in cols:
             con.execute(f"ALTER TABLE applications ADD COLUMN {name} {ddl}")
+    if "user_email" not in cols:
+        con.execute("ALTER TABLE applications ADD COLUMN user_email TEXT NOT NULL DEFAULT ''")
+        con.execute("UPDATE applications SET user_email=? WHERE user_email=''", (ADMIN_EMAIL,))
+
+    # skills/profile/judge_progress/gap_clusters all had a PRIMARY KEY that
+    # can't just gain a column (name/key/id=1 alone used to BE the identity)
+    # -- SQLite can't ALTER a primary key, so these are rename-copy-drop.
+    cols = {r[1] for r in con.execute("PRAGMA table_info(skills)").fetchall()}
+    if cols and "user_email" not in cols:
+        con.execute("ALTER TABLE skills RENAME TO skills_old")
+        con.execute("CREATE TABLE skills (user_email TEXT NOT NULL, name TEXT NOT NULL, "
+                     "category TEXT NOT NULL, active INTEGER DEFAULT 1, PRIMARY KEY (user_email, name))")
+        con.execute("INSERT INTO skills (user_email, name, category, active) "
+                     "SELECT ?, name, category, active FROM skills_old", (ADMIN_EMAIL,))
+        con.execute("DROP TABLE skills_old")
+
+    cols = {r[1] for r in con.execute("PRAGMA table_info(profile)").fetchall()}
+    if cols and "user_email" not in cols:
+        con.execute("ALTER TABLE profile RENAME TO profile_old")
+        con.execute("CREATE TABLE profile (user_email TEXT NOT NULL, key TEXT NOT NULL, "
+                     "value TEXT NOT NULL, PRIMARY KEY (user_email, key))")
+        con.execute("INSERT INTO profile (user_email, key, value) "
+                     "SELECT ?, key, value FROM profile_old", (ADMIN_EMAIL,))
+        con.execute("DROP TABLE profile_old")
+
+    for table in ("judge_progress", "gap_clusters"):
+        cols = {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}
+        if cols and "user_email" not in cols:
+            con.execute(f"ALTER TABLE {table} RENAME TO {table}_old")
+            con.execute(f"CREATE TABLE {table} (user_email TEXT PRIMARY KEY, data TEXT NOT NULL)")
+            con.execute(f"INSERT INTO {table} (user_email, data) SELECT ?, data FROM {table}_old WHERE id=1",
+                        (ADMIN_EMAIL,))
+            con.execute(f"DROP TABLE {table}_old")
+
+    # One-time backfill: whatever scoring/status/notification state already
+    # existed on jobs (pre-cutover) becomes ADMIN_EMAIL's own job_user_state
+    # rows. Guarded on job_user_state being empty so this full scan only
+    # ever runs once, not on every connect().
+    if had_old_scoring_cols and con.execute("SELECT COUNT(*) FROM job_user_state").fetchone()[0] == 0:
+        old_rows = con.execute(
+            "SELECT id, status, llm_score, llm_reason, llm_judged_ts, llm_missing, "
+            "llm_projects, llm_requirements, notified_ts FROM jobs "
+            "WHERE status != 'new' OR llm_score IS NOT NULL OR notified_ts IS NOT NULL"
+        ).fetchall()
+        for r in old_rows:
+            con.execute(
+                "INSERT OR IGNORE INTO job_user_state (user_email, job_id, status, llm_score, "
+                "llm_reason, llm_judged_ts, llm_missing, llm_projects, llm_requirements, notified_ts) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (ADMIN_EMAIL, r["id"], r["status"], r["llm_score"], r["llm_reason"], r["llm_judged_ts"],
+                 r["llm_missing"], r["llm_projects"], r["llm_requirements"], r["notified_ts"]),
+            )
+
+    # Seed the admin -- the one email that was already the whole auth system
+    # (ALLOWED_LOGIN_EMAIL) becomes role='admin' in the new whitelist table,
+    # so the cutover to multi-user never locks out the person who was
+    # already the only user.
+    con.execute("INSERT OR IGNORE INTO users (email, role, added_ts) VALUES (?, 'admin', ?)",
+                (ADMIN_EMAIL, time.time()))
 
     # jobs had ZERO indexes beyond the implicit rowid -- every url/
     # content_hash lookup (jobs_find_duplicate, called once per posting on
@@ -216,6 +313,7 @@ def _migrate(con):
     # per fetch, not a micro-optimization.
     con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_url ON jobs(url)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_content_hash ON jobs(content_hash)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_job_user_state_user ON job_user_state(user_email)")
     con.commit()
 
 
@@ -242,57 +340,59 @@ def connect():
 _PROFILE_VERSION_KEY = "_profile_version_ts"
 
 
-def _touch_profile_version():
+def _touch_profile_version(user_email):
     """Called by every point_bank/skills/profile write. A job's llm_judged_ts
-    older than this means the candidate's own data changed since it was
-    scored -- eligible for re-judging. Raw SQL, not profile_set(), so this
-    internal bookkeeping key never shows up mixed in with user-facing
-    profile fields."""
+    older than THIS USER'S profile_version_ts means their own data changed
+    since it was scored -- eligible for re-judging. Per-user: one person
+    editing their resume must never mark another person's jobs stale. Raw
+    SQL, not profile_set(), so this internal bookkeeping key never shows up
+    mixed in with user-facing profile fields."""
     con = connect()
     con.execute(
-        "INSERT INTO profile (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (_PROFILE_VERSION_KEY, str(time.time())),
+        "INSERT INTO profile (user_email, key, value) VALUES (?, ?, ?) "
+        "ON CONFLICT(user_email, key) DO UPDATE SET value=excluded.value",
+        (user_email, _PROFILE_VERSION_KEY, str(time.time())),
     )
     con.commit()
     con.close()
 
 
-def profile_version_ts():
+def profile_version_ts(user_email):
     con = connect()
-    row = con.execute("SELECT value FROM profile WHERE key=?", (_PROFILE_VERSION_KEY,)).fetchone()
+    row = con.execute("SELECT value FROM profile WHERE user_email=? AND key=?",
+                       (user_email, _PROFILE_VERSION_KEY)).fetchone()
     con.close()
     return float(row["value"]) if row else 0.0
 
 
 # ── point bank ──────────────────────────────────────────────────────────
-def point_bank_add(company, role, start_date, end_date, text, tags=None,
+def point_bank_add(user_email, company, role, start_date, end_date, text, tags=None,
                     metrics=None, source_note="", entry_type="role"):
     con = connect()
     cur = con.execute(
-        "INSERT INTO point_bank (company, role, start_date, end_date, text, "
-        "tags, metrics, source_note, entry_type) VALUES (?,?,?,?,?,?,?,?,?)",
-        (company, role, start_date, end_date, text,
+        "INSERT INTO point_bank (user_email, company, role, start_date, end_date, text, "
+        "tags, metrics, source_note, entry_type) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (user_email, company, role, start_date, end_date, text,
          json.dumps(tags or []), json.dumps(metrics or []), source_note, entry_type),
     )
     con.commit()
     pid = cur.lastrowid
     con.close()
-    _touch_profile_version()
+    _touch_profile_version(user_email)
     return pid
 
 
-def point_bank_find_similar(text, threshold=0.82):
-    """Best near-duplicate already in the point bank, or None. Catches the
-    real case that kept happening: uploading a second resume variant
-    re-extracts the same accomplishment reworded slightly, and it was
-    getting added again with zero check. difflib.SequenceMatcher on
+def point_bank_find_similar(user_email, text, threshold=0.82):
+    """Best near-duplicate already in this user's point bank, or None.
+    Catches the real case that kept happening: uploading a second resume
+    variant re-extracts the same accomplishment reworded slightly, and it
+    was getting added again with zero check. difflib.SequenceMatcher on
     normalized text (stdlib, no new dependency) -- not exact-match, since
     "Built X" and "Built and owned X" describing the same thing should
     still catch each other."""
     norm = re.sub(r"\s+", " ", text.strip().lower())
     best, best_ratio = None, 0.0
-    for row in point_bank_all(active_only=False):
+    for row in point_bank_all(user_email, active_only=False):
         existing_norm = re.sub(r"\s+", " ", row["text"].strip().lower())
         ratio = difflib.SequenceMatcher(None, norm, existing_norm).ratio()
         if ratio > best_ratio:
@@ -302,13 +402,14 @@ def point_bank_find_similar(text, threshold=0.82):
     return None, 0.0
 
 
-def point_bank_all(active_only=True):
+def point_bank_all(user_email, active_only=True):
     con = connect()
-    q = "SELECT * FROM point_bank"
+    q = "SELECT * FROM point_bank WHERE user_email=?"
+    params = [user_email]
     if active_only:
-        q += " WHERE active = 1"
+        q += " AND active = 1"
     q += " ORDER BY start_date DESC, id"
-    rows = [dict(r) for r in con.execute(q).fetchall()]
+    rows = [dict(r) for r in con.execute(q, params).fetchall()]
     con.close()
     for r in rows:
         r["tags"] = json.loads(r["tags"])
@@ -316,82 +417,92 @@ def point_bank_all(active_only=True):
     return rows
 
 
-def point_bank_set_active(pid, active):
+def point_bank_set_active(user_email, pid, active):
+    """Scoped by user_email in the WHERE clause, not just id -- a pid that
+    belongs to someone else's point bank silently affects 0 rows rather
+    than ever being editable cross-user."""
     con = connect()
-    con.execute("UPDATE point_bank SET active=? WHERE id=?", (1 if active else 0, pid))
+    con.execute("UPDATE point_bank SET active=? WHERE id=? AND user_email=?",
+                (1 if active else 0, pid, user_email))
     con.commit()
     con.close()
-    _touch_profile_version()
+    _touch_profile_version(user_email)
 
 
-def point_bank_update_text(pid, text):
+def point_bank_update_text(user_email, pid, text):
     con = connect()
-    con.execute("UPDATE point_bank SET text=? WHERE id=?", (text, pid))
+    con.execute("UPDATE point_bank SET text=? WHERE id=? AND user_email=?", (text, pid, user_email))
     con.commit()
     con.close()
-    _touch_profile_version()
+    _touch_profile_version(user_email)
 
 
-def point_bank_update_entry_type(pid, entry_type, role=None):
+def point_bank_update_entry_type(user_email, pid, entry_type, role=None):
     """Reclassify a row between 'role' and 'project'. `role` optionally
     overwrites the role/tagline column in the same call -- needed when a
     row was filed as a fake 'role' (e.g. titled "Builder") for something
     that's really one project's tagline line, not a job title."""
     con = connect()
     if role is None:
-        con.execute("UPDATE point_bank SET entry_type=? WHERE id=?", (entry_type, pid))
+        con.execute("UPDATE point_bank SET entry_type=? WHERE id=? AND user_email=?",
+                    (entry_type, pid, user_email))
     else:
-        con.execute("UPDATE point_bank SET entry_type=?, role=? WHERE id=?", (entry_type, role, pid))
+        con.execute("UPDATE point_bank SET entry_type=?, role=? WHERE id=? AND user_email=?",
+                    (entry_type, role, pid, user_email))
     con.commit()
     con.close()
-    _touch_profile_version()
+    _touch_profile_version(user_email)
 
 
 # ── skills ──────────────────────────────────────────────────────────────
-def skills_add(name, category):
-    # Case-insensitive lookup -- the UNIQUE constraint on name is case-
-    # sensitive, so "Embeddings" and "embeddings" used to insert as two
+def skills_add(user_email, name, category):
+    # Case-insensitive lookup -- the composite PK (user_email, name) is
+    # case-sensitive, so "Embeddings" and "embeddings" used to insert as two
     # separate rows (found as real duplicate data: 6 skills double-counted
     # this way). Keeps whichever casing is already stored rather than
     # silently renaming it on a re-add with different casing.
     con = connect()
-    existing = con.execute("SELECT id FROM skills WHERE LOWER(name)=LOWER(?)", (name,)).fetchone()
+    existing = con.execute("SELECT name FROM skills WHERE user_email=? AND LOWER(name)=LOWER(?)",
+                            (user_email, name)).fetchone()
     if existing:
-        con.execute("UPDATE skills SET category=?, active=1 WHERE id=?", (category, existing["id"]))
+        con.execute("UPDATE skills SET category=?, active=1 WHERE user_email=? AND name=?",
+                    (category, user_email, existing["name"]))
     else:
-        con.execute("INSERT INTO skills (name, category) VALUES (?,?)", (name, category))
+        con.execute("INSERT INTO skills (user_email, name, category) VALUES (?,?,?)",
+                    (user_email, name, category))
     con.commit()
     con.close()
-    _touch_profile_version()
+    _touch_profile_version(user_email)
 
 
-def skills_all(active_only=True):
+def skills_all(user_email, active_only=True):
     con = connect()
-    q = "SELECT * FROM skills"
+    q = "SELECT * FROM skills WHERE user_email=?"
+    params = [user_email]
     if active_only:
-        q += " WHERE active = 1"
+        q += " AND active = 1"
     q += " ORDER BY category, name"
-    rows = [dict(r) for r in con.execute(q).fetchall()]
+    rows = [dict(r) for r in con.execute(q, params).fetchall()]
     con.close()
     return rows
 
 
 # ── profile (free-form key/value: name, email, links, summary variants) ──
-def profile_set(key, value):
+def profile_set(user_email, key, value):
     con = connect()
     con.execute(
-        "INSERT INTO profile (key, value) VALUES (?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, value),
+        "INSERT INTO profile (user_email, key, value) VALUES (?,?,?) "
+        "ON CONFLICT(user_email, key) DO UPDATE SET value=excluded.value",
+        (user_email, key, value),
     )
     con.commit()
     con.close()
-    _touch_profile_version()
+    _touch_profile_version(user_email)
 
 
-def profile_all():
+def profile_all(user_email):
     con = connect()
-    rows = con.execute("SELECT key, value FROM profile").fetchall()
+    rows = con.execute("SELECT key, value FROM profile WHERE user_email=?", (user_email,)).fetchall()
     con.close()
     return {r["key"]: r["value"] for r in rows if r["key"] != _PROFILE_VERSION_KEY}
 
@@ -415,6 +526,43 @@ def telegram_config_set(user_email, bot_token, chat_id):
         "chat_id=excluded.chat_id, updated_ts=excluded.updated_ts",
         (user_email, bot_token, chat_id, time.time()),
     )
+    con.commit()
+    con.close()
+
+
+# ── users (the admin whitelist -- who's allowed to actually use the app) ─
+def users_all():
+    con = connect()
+    rows = con.execute("SELECT * FROM users ORDER BY role DESC, added_ts").fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def users_get(email):
+    con = connect()
+    row = con.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    con.close()
+    return dict(row) if row else None
+
+
+def users_add(email):
+    """Whitelist one email -- always role='whitelisted'; the admin role is
+    only ever seeded once, from ALLOWED_LOGIN_EMAIL (see _migrate), never
+    grantable through this function. INSERT OR IGNORE: re-adding someone
+    already on the list is a harmless no-op, not an error."""
+    con = connect()
+    con.execute("INSERT OR IGNORE INTO users (email, role, added_ts) VALUES (?, 'whitelisted', ?)",
+                (email, time.time()))
+    con.commit()
+    con.close()
+
+
+def users_remove(email):
+    """Refuses to remove an admin -- the whitelist UI can only ever remove
+    someone it also added (role='whitelisted'); there is no path to
+    locking every admin out of their own app through this function."""
+    con = connect()
+    con.execute("DELETE FROM users WHERE email=? AND role != 'admin'", (email,))
     con.commit()
     con.close()
 
@@ -449,19 +597,20 @@ def jobs_backfill_description(jid, description_raw):
     content a fetcher bug dropped the first time around (e.g. Lever's
     separate 'lists' field never being read), not the normal fetch path,
     which only ever inserts or leaves alone (see jobs_add). Recomputes
-    content_hash to match the new text, and resets llm_judged_ts to 0 so
-    jobs_llm_score_stale() correctly flags this row for re-judging -- a
-    content change isn't caught by the profile_version_ts mechanism, which
-    only tracks changes to the candidate's own master doc, not to a job
-    posting's JD."""
+    content_hash to match the new text, and resets llm_judged_ts to 0 for
+    EVERY user who's scored this job -- a content change invalidates
+    everyone's score on this shared posting, not just one user's, and
+    isn't caught by profile_version_ts (which only tracks changes to each
+    candidate's own master doc, not to a job posting's JD)."""
     con = connect()
     row = con.execute("SELECT company, title FROM jobs WHERE id=?", (jid,)).fetchone()
     if not row:
         con.close()
         return
     h = _content_hash(row["company"], row["title"], description_raw)
-    con.execute("UPDATE jobs SET description_raw=?, content_hash=?, llm_judged_ts=0 WHERE id=?",
+    con.execute("UPDATE jobs SET description_raw=?, content_hash=? WHERE id=?",
                 (description_raw, h, jid))
+    con.execute("UPDATE job_user_state SET llm_judged_ts=0 WHERE job_id=?", (jid,))
     con.commit()
     con.close()
 
@@ -497,22 +646,35 @@ def jobs_add(source, company, title, url, description_raw, location="", posted_t
     return jid, True
 
 
-def jobs_list(status=None):
+# Every per-user scoring/status/notification field, joined onto the shared
+# jobs row for ONE user -- the same dict shape callers used when these were
+# plain columns on jobs, so jobs_list/jobs_query/jobs_get callers elsewhere
+# don't need to change how they read a job dict, only how they ask for one.
+_JOB_USER_JOIN = (
+    "LEFT JOIN job_user_state s ON s.job_id = j.id AND s.user_email = ? "
+)
+_JOB_USER_COLS = (
+    "COALESCE(s.status, 'new') AS status, s.llm_score AS llm_score, "
+    "s.llm_reason AS llm_reason, s.llm_judged_ts AS llm_judged_ts, "
+    "s.llm_missing AS llm_missing, s.llm_projects AS llm_projects, "
+    "s.llm_requirements AS llm_requirements, s.notified_ts AS notified_ts"
+)
+
+
+def jobs_list(user_email, status=None):
     con = connect()
+    q = f"SELECT j.*, {_JOB_USER_COLS} FROM jobs j {_JOB_USER_JOIN}"
+    params = [user_email]
     if status:
-        rows = con.execute(
-            "SELECT * FROM jobs WHERE status=? ORDER BY llm_score DESC NULLS LAST, fetched_ts DESC",
-            (status,),
-        ).fetchall()
-    else:
-        rows = con.execute(
-            "SELECT * FROM jobs ORDER BY llm_score DESC NULLS LAST, fetched_ts DESC"
-        ).fetchall()
+        q += "WHERE COALESCE(s.status, 'new') = ? "
+        params.append(status)
+    q += "ORDER BY s.llm_score DESC NULLS LAST, j.fetched_ts DESC"
+    rows = con.execute(q, params).fetchall()
     con.close()
     return [dict(r) for r in rows]
 
 
-def jobs_query(status=None, eng_only=True, level_tiers=None, min_score=None, q_text="",
+def jobs_query(user_email, status=None, eng_only=True, level_tiers=None, min_score=None, q_text="",
                company_filter="", source_filter="", date_cutoff=None, exclude_applied=True):
     """The real filter for the Postings list -- one SQL query with a WHERE
     clause SQLite evaluates per row while scanning, not a SELECT * pulled
@@ -526,14 +688,19 @@ def jobs_query(status=None, eng_only=True, level_tiers=None, min_score=None, q_t
     India/Bangalore/Bengaluru location is unconditional, not a parameter --
     this whole app only ever targets that location now.
 
+    status/llm_score/notified/etc all come from job_user_state scoped to
+    user_email -- two users looking at the same shared posting never see
+    each other's score or status.
+
     Returns (total_unfiltered, matched_jobs) -- matched_jobs already sorted
     by fetch date descending (newest first), score as the tiebreaker among
     postings fetched at the same time."""
     con = connect()
 
-    unfiltered_q, unfiltered_params = "SELECT COUNT(*) FROM jobs", []
+    unfiltered_q, unfiltered_params = (
+        f"SELECT COUNT(*) FROM jobs j {_JOB_USER_JOIN}", [user_email])
     if status:
-        unfiltered_q += " WHERE status=?"
+        unfiltered_q += "WHERE COALESCE(s.status, 'new') = ?"
         unfiltered_params.append(status)
     total_unfiltered = con.execute(unfiltered_q, unfiltered_params).fetchone()[0]
 
@@ -545,49 +712,55 @@ def jobs_query(status=None, eng_only=True, level_tiers=None, min_score=None, q_t
     # AUTOMATED feed (it discards ~11k US/EU postings per cron fetch); a job the
     # user deliberately added by hand is wanted by definition and should always
     # show up.
-    where, params = ["(source = 'manual' OR IS_TARGET_LOCATION(location, description_raw) = 1)"], []
+    where = ["(j.source = 'manual' OR IS_TARGET_LOCATION(j.location, j.description_raw) = 1)"]
+    params = [user_email]
     if status:
-        where.append("status=?")
+        where.append("COALESCE(s.status, 'new') = ?")
         params.append(status)
     if eng_only:
-        where.append("IS_ENGINEERING_TITLE(title) = 1")
+        where.append("IS_ENGINEERING_TITLE(j.title) = 1")
     if level_tiers:
-        where.append(f"SENIORITY_TIER(title) IN ({','.join('?' * len(level_tiers))})")
+        where.append(f"SENIORITY_TIER(j.title) IN ({','.join('?' * len(level_tiers))})")
         params.extend(level_tiers)
     if min_score is not None:
         # NULL llm_score (not yet AI-judged) always passes -- "llm_score >= ?"
         # alone would silently drop every unjudged posting, since SQL compares
         # against NULL as false, which is the opposite of what a min-score
         # filter should do before judging has even run.
-        where.append("(llm_score IS NULL OR llm_score >= ?)")
+        where.append("(s.llm_score IS NULL OR s.llm_score >= ?)")
         params.append(float(min_score))
     if q_text:
-        where.append("(LOWER(company) LIKE ? OR LOWER(title) LIKE ?)")
+        where.append("(LOWER(j.company) LIKE ? OR LOWER(j.title) LIKE ?)")
         like = f"%{q_text}%"
         params.extend([like, like])
     if company_filter:
-        where.append("LOWER(company) = ?")
+        where.append("LOWER(j.company) = ?")
         params.append(company_filter)
     if source_filter == "manual":
-        where.append("source = 'manual'")
+        where.append("j.source = 'manual'")
     elif source_filter == "auto":
-        where.append("source != 'manual'")
+        where.append("j.source != 'manual'")
     if date_cutoff is not None:
-        where.append("fetched_ts >= ?")
+        where.append("j.fetched_ts >= ?")
         params.append(date_cutoff)
     if exclude_applied:
-        where.append("id NOT IN (SELECT DISTINCT job_id FROM applications WHERE status != 'generated')")
+        where.append("j.id NOT IN (SELECT DISTINCT job_id FROM applications "
+                      "WHERE status != 'generated' AND user_email = ?)")
+        params.append(user_email)
 
-    query = ("SELECT * FROM jobs WHERE " + " AND ".join(where) +
-              " ORDER BY fetched_ts DESC, llm_score DESC NULLS LAST")
+    query = (f"SELECT j.*, {_JOB_USER_COLS} FROM jobs j {_JOB_USER_JOIN}WHERE " + " AND ".join(where) +
+              " ORDER BY j.fetched_ts DESC, s.llm_score DESC NULLS LAST")
     rows = con.execute(query, params).fetchall()
     con.close()
     return total_unfiltered, [dict(r) for r in rows]
 
 
-def jobs_get(jid):
+def jobs_get(user_email, jid):
     con = connect()
-    row = con.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
+    row = con.execute(
+        f"SELECT j.*, {_JOB_USER_COLS} FROM jobs j {_JOB_USER_JOIN}WHERE j.id=?",
+        (user_email, jid),
+    ).fetchone()
     con.close()
     return dict(row) if row else None
 
@@ -605,57 +778,85 @@ def jobs_added_count(start_ts, end_ts=None):
     return row[0]
 
 
-
-
-def jobs_set_llm_score(jid, score, reason, missing=None, projects=None, requirements=None):
+def jobs_ids():
+    """Every job id in the shared postings table -- no per-user join, for
+    callers (the fetch before/after diff) that only need to know which
+    ids exist, not anyone's personalized view of them."""
     con = connect()
-    con.execute("UPDATE jobs SET llm_score=?, llm_reason=?, llm_judged_ts=?, llm_missing=?, llm_projects=?, "
-                "llm_requirements=? WHERE id=?",
-                (score, reason, time.time(), json.dumps(missing or []), json.dumps(projects or []),
-                 json.dumps(requirements or []), jid))
+    rows = con.execute("SELECT id FROM jobs").fetchall()
+    con.close()
+    return {r["id"] for r in rows}
+
+
+
+
+def _ensure_job_user_row(con, user_email, jid):
+    """INSERT OR IGNORE -- makes sure a (user_email, job_id) row exists so a
+    plain UPDATE below has something to touch, without ever overwriting
+    columns an UPDATE isn't setting."""
+    con.execute("INSERT OR IGNORE INTO job_user_state (user_email, job_id) VALUES (?,?)",
+                (user_email, jid))
+
+
+def jobs_set_llm_score(user_email, jid, score, reason, missing=None, projects=None, requirements=None):
+    con = connect()
+    con.execute(
+        "INSERT INTO job_user_state (user_email, job_id, llm_score, llm_reason, llm_judged_ts, "
+        "llm_missing, llm_projects, llm_requirements) VALUES (?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(user_email, job_id) DO UPDATE SET llm_score=excluded.llm_score, "
+        "llm_reason=excluded.llm_reason, llm_judged_ts=excluded.llm_judged_ts, "
+        "llm_missing=excluded.llm_missing, llm_projects=excluded.llm_projects, "
+        "llm_requirements=excluded.llm_requirements",
+        (user_email, jid, score, reason, time.time(), json.dumps(missing or []),
+         json.dumps(projects or []), json.dumps(requirements or [])),
+    )
     con.commit()
     con.close()
 
 
-def jobs_mark_notified(jid):
+def jobs_mark_notified(user_email, jid):
     """Called once the poll loop has actually sent a crossed-threshold
-    notification for this job -- the gate that stops every later 10-minute
-    tick from re-sending it."""
+    notification for this job to this user -- the gate that stops every
+    later 10-minute tick from re-sending it to them."""
     con = connect()
-    con.execute("UPDATE jobs SET notified_ts=? WHERE id=?", (time.time(), jid))
+    _ensure_job_user_row(con, user_email, jid)
+    con.execute("UPDATE job_user_state SET notified_ts=? WHERE user_email=? AND job_id=?",
+                (time.time(), user_email, jid))
     con.commit()
     con.close()
 
 
-def jobs_clear_notified(jid):
+def jobs_clear_notified(user_email, jid):
     """Called when a job's score drops back below the notify threshold, so
-    a later genuine re-crossing notifies again instead of being silently
-    swallowed forever by the first notification."""
+    a later genuine re-crossing notifies this user again instead of being
+    silently swallowed forever by the first notification."""
     con = connect()
-    con.execute("UPDATE jobs SET notified_ts=NULL WHERE id=?", (jid,))
+    con.execute("UPDATE job_user_state SET notified_ts=NULL WHERE user_email=? AND job_id=?",
+                (user_email, jid))
     con.commit()
     con.close()
 
 
-def jobs_llm_score_stale(job):
-    """True if this posting has never been judged, or was judged before the
-    candidate's own point bank/skills/profile last changed -- the "don't
-    re-judge unless the master doc changed" rule. A judged posting whose
-    score predates the latest profile edit is treated the same as an
-    unjudged one; everything else is left alone."""
+def jobs_llm_score_stale(user_email, job):
+    """True if this posting has never been judged FOR THIS USER, or was
+    judged before this user's own point bank/skills/profile last changed --
+    the "don't re-judge unless the master doc changed" rule. A judged
+    posting whose score predates the latest profile edit is treated the
+    same as an unjudged one; everything else is left alone."""
     if job["llm_score"] is None:
         return True
     judged_ts = job["llm_judged_ts"] or 0
-    return judged_ts < profile_version_ts()
+    return judged_ts < profile_version_ts(user_email)
 
 
-def jobs_clear_llm_scores(date_cutoff=None):
-    """Wipe llm_score/llm_reason/llm_judged_ts -- the explicit "force
-    reload" the UI offers, for when the profile changed enough that you
-    want a clean re-judge pass rather than relying on the staleness check
-    alone. date_cutoff (optional, a fetched_ts): only clears postings
-    fetched at or after it, so clearing doesn't also make a posting from
-    months back newly eligible for a real LLM spend on the next judge pass.
+def jobs_clear_llm_scores(user_email, date_cutoff=None):
+    """Wipe this user's llm_score/llm_reason/llm_judged_ts -- the explicit
+    "force reload" the UI offers, for when their profile changed enough
+    that they want a clean re-judge pass rather than relying on the
+    staleness check alone. date_cutoff (optional, a fetched_ts): only
+    clears postings fetched at or after it, so clearing doesn't also make
+    a posting from months back newly eligible for a real LLM spend on the
+    next judge pass.
 
     Also clears notified_ts -- found live: clearing a score and re-judging
     it via the AI-judge button never re-notified, even when the fresh
@@ -669,86 +870,86 @@ def jobs_clear_llm_scores(date_cutoff=None):
 
     Returns how many rows were actually cleared."""
     con = connect()
+    q = ("UPDATE job_user_state SET llm_score=NULL, llm_reason='', llm_judged_ts=NULL, "
+         "llm_missing='[]', llm_projects='[]', llm_requirements='[]', notified_ts=NULL "
+         "WHERE user_email=? AND llm_score IS NOT NULL")
+    params = [user_email]
     if date_cutoff is not None:
-        cur = con.execute(
-            "UPDATE jobs SET llm_score=NULL, llm_reason='', llm_judged_ts=NULL, llm_missing='[]', "
-            "llm_projects='[]', llm_requirements='[]', notified_ts=NULL "
-            "WHERE llm_score IS NOT NULL AND fetched_ts >= ?",
-            (date_cutoff,),
-        )
-    else:
-        cur = con.execute(
-            "UPDATE jobs SET llm_score=NULL, llm_reason='', llm_judged_ts=NULL, llm_missing='[]', "
-            "llm_projects='[]', llm_requirements='[]', notified_ts=NULL "
-            "WHERE llm_score IS NOT NULL"
-        )
+        q += " AND job_id IN (SELECT id FROM jobs WHERE fetched_ts >= ?)"
+        params.append(date_cutoff)
+    cur = con.execute(q, params)
     con.commit()
     n = cur.rowcount
     con.close()
     return n
 
 
-def jobs_set_status(jid, status):
-    con = connect()
-    con.execute("UPDATE jobs SET status=? WHERE id=?", (status, jid))
-    con.commit()
-    con.close()
-
-
-def judge_progress_get():
-    """The last known AI-judge batch state, or None if one's never run.
-    Survives a server restart -- this is disk, not the process's own
-    memory."""
-    con = connect()
-    row = con.execute("SELECT data FROM judge_progress WHERE id = 1").fetchone()
-    con.close()
-    return json.loads(row["data"]) if row else None
-
-
-def judge_progress_set(data):
-    """Overwrites the one current/last-known state -- called on every real
-    change (batch start, each job finishing, batch end), not just at the
-    end, so a crash or restart mid-batch still leaves the real, honest
-    progress on disk instead of nothing."""
+def jobs_set_status(user_email, jid, status):
     con = connect()
     con.execute(
-        "INSERT INTO judge_progress (id, data) VALUES (1, ?) "
-        "ON CONFLICT(id) DO UPDATE SET data = excluded.data",
-        (json.dumps(data),),
+        "INSERT INTO job_user_state (user_email, job_id, status) VALUES (?,?,?) "
+        "ON CONFLICT(user_email, job_id) DO UPDATE SET status=excluded.status",
+        (user_email, jid, status),
     )
     con.commit()
     con.close()
 
 
-def gap_clusters_get():
-    """The last computed Gaps-tab result, or None if it's never been run."""
+def judge_progress_get(user_email):
+    """This user's last known AI-judge batch state, or None if they've
+    never run one. Survives a server restart -- this is disk, not the
+    process's own memory."""
     con = connect()
-    row = con.execute("SELECT data FROM gap_clusters WHERE id = 1").fetchone()
+    row = con.execute("SELECT data FROM judge_progress WHERE user_email=?", (user_email,)).fetchone()
     con.close()
     return json.loads(row["data"]) if row else None
 
 
-def gap_clusters_set(data):
-    """Overwrites the one cached result -- called only when the Gaps tab
-    actually recomputes (first-ever load, or an explicit Refresh), never
-    on a plain tab-open."""
+def judge_progress_set(user_email, data):
+    """Overwrites this user's one current/last-known state -- called on
+    every real change (batch start, each job finishing, batch end), not
+    just at the end, so a crash or restart mid-batch still leaves the
+    real, honest progress on disk instead of nothing."""
     con = connect()
     con.execute(
-        "INSERT INTO gap_clusters (id, data) VALUES (1, ?) "
-        "ON CONFLICT(id) DO UPDATE SET data = excluded.data",
-        (json.dumps(data),),
+        "INSERT INTO judge_progress (user_email, data) VALUES (?, ?) "
+        "ON CONFLICT(user_email) DO UPDATE SET data = excluded.data",
+        (user_email, json.dumps(data)),
+    )
+    con.commit()
+    con.close()
+
+
+def gap_clusters_get(user_email):
+    """This user's last computed Gaps-tab result, or None if it's never
+    been run."""
+    con = connect()
+    row = con.execute("SELECT data FROM gap_clusters WHERE user_email=?", (user_email,)).fetchone()
+    con.close()
+    return json.loads(row["data"]) if row else None
+
+
+def gap_clusters_set(user_email, data):
+    """Overwrites this user's one cached result -- called only when the
+    Gaps tab actually recomputes (first-ever load, or an explicit
+    Refresh), never on a plain tab-open."""
+    con = connect()
+    con.execute(
+        "INSERT INTO gap_clusters (user_email, data) VALUES (?, ?) "
+        "ON CONFLICT(user_email) DO UPDATE SET data = excluded.data",
+        (user_email, json.dumps(data)),
     )
     con.commit()
     con.close()
 
 
 # ── applications ────────────────────────────────────────────────────────
-def applications_add(job_id, resume_path, cover_letter_path, ats_estimate, folder_path):
+def applications_add(user_email, job_id, resume_path, cover_letter_path, ats_estimate, folder_path):
     con = connect()
     cur = con.execute(
-        "INSERT INTO applications (job_id, resume_path, cover_letter_path, "
-        "ats_estimate, generated_ts, folder_path) VALUES (?,?,?,?,?,?)",
-        (job_id, resume_path, cover_letter_path, json.dumps(ats_estimate),
+        "INSERT INTO applications (user_email, job_id, resume_path, cover_letter_path, "
+        "ats_estimate, generated_ts, folder_path) VALUES (?,?,?,?,?,?,?)",
+        (user_email, job_id, resume_path, cover_letter_path, json.dumps(ats_estimate),
          time.time(), folder_path),
     )
     con.commit()
@@ -757,33 +958,39 @@ def applications_add(job_id, resume_path, cover_letter_path, ats_estimate, folde
     return aid
 
 
-def applications_find_draft(job_id):
-    """The most recent application for this job still at status='generated'
-    -- materials exist but nothing was actually submitted yet. Used before
-    a regenerate so a second draft replaces the first instead of leaving
-    two rows for the same job (status != 'generated' -- a real submitted
-    application -- is never touched this way; that's a real record, not a
-    draft to overwrite)."""
+def applications_find_draft(user_email, job_id):
+    """This user's most recent application for this job still at
+    status='generated' -- materials exist but nothing was actually
+    submitted yet. Used before a regenerate so a second draft replaces the
+    first instead of leaving two rows for the same job (status !=
+    'generated' -- a real submitted application -- is never touched this
+    way; that's a real record, not a draft to overwrite)."""
     con = connect()
     row = con.execute(
-        "SELECT * FROM applications WHERE job_id=? AND status='generated' "
-        "ORDER BY generated_ts DESC LIMIT 1", (job_id,)
+        "SELECT * FROM applications WHERE job_id=? AND user_email=? AND status='generated' "
+        "ORDER BY generated_ts DESC LIMIT 1", (job_id, user_email)
     ).fetchone()
     con.close()
     return dict(row) if row else None
 
 
-def applications_delete(app_id):
+def applications_delete(user_email, app_id):
+    """Scoped by user_email -- an app_id belonging to someone else's
+    application silently affects 0 rows, never deletable cross-user."""
     con = connect()
-    con.execute("DELETE FROM applications WHERE id=?", (app_id,))
+    con.execute("DELETE FROM applications WHERE id=? AND user_email=?", (app_id, user_email))
     con.commit()
     con.close()
 
 
-def applications_for_job(job_id):
+def applications_for_job(user_email, job_id):
+    """Only THIS user's applications for the shared job -- another user
+    may have generated their own resume/cover letter for the same posting,
+    and that must never show up here."""
     con = connect()
     rows = con.execute(
-        "SELECT * FROM applications WHERE job_id=? ORDER BY generated_ts DESC", (job_id,)
+        "SELECT * FROM applications WHERE job_id=? AND user_email=? ORDER BY generated_ts DESC",
+        (job_id, user_email),
     ).fetchall()
     con.close()
     out = []
@@ -795,53 +1002,59 @@ def applications_for_job(job_id):
     return out
 
 
-def _application_row(con, app_id):
-    row = con.execute("SELECT * FROM applications WHERE id=?", (app_id,)).fetchone()
+def _application_row(con, user_email, app_id):
+    row = con.execute("SELECT * FROM applications WHERE id=? AND user_email=?",
+                       (app_id, user_email)).fetchone()
     if row is None:
-        raise ValueError(f"no application with id={app_id}")
+        raise ValueError(f"no application with id={app_id} for this user")
     return row
 
 
-def applications_already_applied(job_id):
-    """True if any application for this job has moved past 'generated' --
-    i.e. it was actually submitted at some point. The dedup check before
-    marking applied again, or before regenerating without noticing."""
+def applications_already_applied(user_email, job_id):
+    """True if any of THIS user's applications for this job has moved past
+    'generated' -- i.e. they actually submitted at some point. The dedup
+    check before marking applied again, or before regenerating without
+    noticing. Another user's applied status for the same shared job is
+    irrelevant here -- each person's own application funnel is their own."""
     con = connect()
     row = con.execute(
-        "SELECT 1 FROM applications WHERE job_id=? AND status != 'generated' LIMIT 1",
-        (job_id,),
+        "SELECT 1 FROM applications WHERE job_id=? AND user_email=? AND status != 'generated' LIMIT 1",
+        (job_id, user_email),
     ).fetchone()
     con.close()
     return row is not None
 
 
-def applications_all_applied_job_ids():
-    """Every job_id with at least one application past 'generated' -- one
-    query for the whole set, so job-list filtering doesn't run
-    applications_already_applied() once per row."""
+def applications_all_applied_job_ids(user_email):
+    """Every job_id THIS user has at least one application past
+    'generated' for -- one query for the whole set, so job-list filtering
+    doesn't run applications_already_applied() once per row."""
     con = connect()
-    rows = con.execute("SELECT DISTINCT job_id FROM applications WHERE status != 'generated'").fetchall()
+    rows = con.execute(
+        "SELECT DISTINCT job_id FROM applications WHERE status != 'generated' AND user_email=?",
+        (user_email,),
+    ).fetchall()
     con.close()
     return {r["job_id"] for r in rows}
 
 
-def applications_mark_applied(app_id, applied_via, referral_name="", referral_note=""):
+def applications_mark_applied(user_email, app_id, applied_via, referral_name="", referral_note=""):
     """Record the real-world moment of submitting. applied_via: company_site|
     linkedin|referral|recruiter|other."""
     con = connect()
-    row = _application_row(con, app_id)
+    row = _application_row(con, user_email, app_id)
     hist = json.loads(row["status_history"])
     hist.append({"status": "applied", "ts": time.time(), "note": f"via {applied_via}"})
     con.execute(
         "UPDATE applications SET applied_via=?, applied_ts=?, referral_name=?, "
-        "referral_note=?, status='applied', status_history=? WHERE id=?",
-        (applied_via, time.time(), referral_name, referral_note, json.dumps(hist), app_id),
+        "referral_note=?, status='applied', status_history=? WHERE id=? AND user_email=?",
+        (applied_via, time.time(), referral_name, referral_note, json.dumps(hist), app_id, user_email),
     )
     con.commit()
     con.close()
 
 
-def applications_quick_mark_applied(job_id, applied_via, referral_name="", referral_note=""):
+def applications_quick_mark_applied(user_email, job_id, applied_via, referral_name="", referral_note=""):
     """Mark a job applied WITHOUT going through the generate pipeline --
     for the real, common case of applying directly on the company's site or
     LinkedIn, with your own resume, never touching this tool's drafting
@@ -855,10 +1068,10 @@ def applications_quick_mark_applied(job_id, applied_via, referral_name="", refer
     now = time.time()
     hist = [{"status": "applied", "ts": now, "note": f"via {applied_via}"}]
     cur = con.execute(
-        "INSERT INTO applications (job_id, resume_path, cover_letter_path, ats_estimate, "
+        "INSERT INTO applications (user_email, job_id, resume_path, cover_letter_path, ats_estimate, "
         "generated_ts, folder_path, applied_via, applied_ts, referral_name, referral_note, "
-        "status, status_history) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (job_id, "", "", "{}", now, "", applied_via, now, referral_name, referral_note,
+        "status, status_history) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (user_email, job_id, "", "", "{}", now, "", applied_via, now, referral_name, referral_note,
          "applied", json.dumps(hist)),
     )
     con.commit()
@@ -867,27 +1080,28 @@ def applications_quick_mark_applied(job_id, applied_via, referral_name="", refer
     return aid
 
 
-def applications_add_status_event(app_id, status, note=""):
+def applications_add_status_event(user_email, app_id, status, note=""):
     """Append a stage to the funnel: phone_screen, interview, offer,
     rejected, ghosted, withdrawn. Keeps the full history, not just the
     latest stage, so 'what actually happened' is never lost."""
     con = connect()
-    row = _application_row(con, app_id)
+    row = _application_row(con, user_email, app_id)
     hist = json.loads(row["status_history"])
     hist.append({"status": status, "ts": time.time(), "note": note})
     con.execute(
-        "UPDATE applications SET status=?, status_history=? WHERE id=?",
-        (status, json.dumps(hist), app_id),
+        "UPDATE applications SET status=?, status_history=? WHERE id=? AND user_email=?",
+        (status, json.dumps(hist), app_id, user_email),
     )
     con.commit()
     con.close()
 
 
-def applications_all():
+def applications_all(user_email):
     con = connect()
     rows = con.execute(
         "SELECT a.*, j.company, j.title FROM applications a "
-        "JOIN jobs j ON j.id = a.job_id ORDER BY a.generated_ts DESC"
+        "JOIN jobs j ON j.id = a.job_id WHERE a.user_email=? ORDER BY a.generated_ts DESC",
+        (user_email,),
     ).fetchall()
     con.close()
     out = []

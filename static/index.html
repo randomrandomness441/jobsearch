@@ -15,6 +15,11 @@
   <a href="/jobs/" class="active">Jobs</a>
 </nav>
 
+<div id="guest-banner" hidden>
+  You're browsing a read-only preview. Ask the admin to whitelist your account for full access
+  (fetch, AI-judge, generate resumes, edit your profile).
+</div>
+
 <div id="app">
 
   <div id="subnav">
@@ -22,6 +27,7 @@
     <button id="tab-applications" class="subtab">Applications</button>
     <button id="tab-profile" class="subtab">Profile</button>
     <button id="tab-gaps" class="subtab">Gaps</button>
+    <button id="tab-admin" class="subtab" hidden>Admin</button>
     <div id="subnav-spacer"></div>
     <button id="btn-manual">+ Add job manually</button>
     <button id="btn-refetch">Fetch new</button>
@@ -138,6 +144,19 @@
       </div>
       <span id="pf-tg-result" class="dim"></span>
     </div>
+  </div>
+
+  <!-- ── admin: whitelist control (admin role only) ──────────────── -->
+  <div id="view-admin" class="view" hidden>
+    <h2 class="h2-sm">Whitelist</h2>
+    <p class="dim">Only whitelisted emails (and you, the admin) can log in with real access.
+      Anyone else who signs in sees a read-only guest preview.</p>
+    <div class="row row-start">
+      <input id="admin-new-email" type="text" placeholder="someone@example.com">
+      <button id="admin-add-btn" class="primary">Add to whitelist</button>
+    </div>
+    <span id="admin-result" class="dim"></span>
+    <div id="admin-users-list" class="mt-sm"></div>
   </div>
 
   <!-- ── manage entries (fields / skills / point bank) ────────────── -->
