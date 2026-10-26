@@ -2459,6 +2459,17 @@ class Handler(BaseHTTPRequestHandler):
             location = b.get("location", "").strip()
             if not company or not title or not text:
                 return self._json({"error": "company, title, and text are required"}, 400)
+            # The real boundary check for the "whole description ended up in the
+            # title" bug -- the frontend now auto-splits title from the pasted
+            # text and flags an overlong guess for the user to fix (see
+            # static/jobparse.js), but that's a UI nicety, not an enforced
+            # guarantee: a direct API call (curl, a future client) could still
+            # send a multi-paragraph "title". Reject outright rather than
+            # silently truncating -- a 400 the caller can fix beats storing
+            # corrupted data that looks fine until someone reads it.
+            if len(title) > 200:
+                return self._json({"error": f"title is implausibly long ({len(title)} chars) -- "
+                                              "looks like the description ended up in the title field"}, 400)
             jid, is_new = jobsdb.jobs_add("manual", company, title, url, text, location)
             return self._json({"job_id": jid, "is_new": is_new})
 

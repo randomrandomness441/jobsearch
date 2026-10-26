@@ -209,11 +209,14 @@
   <!-- ── manual add modal ──────────────────────────────────────────── -->
   <div id="manual-modal" class="panel" hidden>
     <h2>Add a job manually</h2>
-    <p class="dim">Paste the whole posting -- title on the first line, location on the second,
-      description below, exactly as copied. Title and location are pulled out automatically.
-      Dedup runs on submit; run AI-judge afterward to get a fit score.</p>
+    <p class="dim">Paste the whole posting -- title and location are guessed from the first couple
+      of lines and filled in below; check the Title field and fix it if the guess looks wrong
+      (e.g. too long, or includes part of the description) before adding. Dedup runs on submit;
+      run AI-judge afterward to get a fit score.</p>
     <label>Company <input id="m-company" type="text"></label>
     <label>Paste job posting <textarea id="m-text" rows="14" placeholder="Software Development Engineer II&#10;Remote (India)&#10;About Us...&#10;..."></textarea></label>
+    <label>Title <input id="m-title" type="text" placeholder="auto-filled from the paste above -- edit if it looks wrong"></label>
+    <label>Location (optional) <input id="m-location" type="text"></label>
     <label>URL (optional) <input id="m-url" type="text"></label>
     <div class="row">
       <button id="m-cancel">Cancel</button>
@@ -231,6 +234,7 @@
 
 </div>
 
+<script src="jobparse.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

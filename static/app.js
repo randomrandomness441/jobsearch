@@ -375,6 +375,8 @@ function openManual() {
   document.getElementById('m-company').value = '';
   document.getElementById('m-url').value = '';
   document.getElementById('m-text').value = '';
+  document.getElementById('m-title').value = '';
+  document.getElementById('m-location').value = '';
   document.getElementById('m-result').innerHTML = '';
   document.getElementById('overlay').hidden = false;
   document.getElementById('manual-modal').hidden = false;
@@ -383,30 +385,35 @@ function closeManual() {
   document.getElementById('overlay').hidden = true;
   document.getElementById('manual-modal').hidden = true;
 }
-// First non-empty line is the title; the next one is the location IF it
-// looks like one (short, and either "Remote"/"Hybrid"/India-ish, or a
-// plain "City, Country" with no sentence punctuation) -- otherwise it's
-// already prose and there's no separate location line to pull out.
-function parseJobPaste(raw) {
-  const lines = raw.split('\n').map(l => l.trim());
-  let i = 0;
-  while (i < lines.length && !lines[i]) i++;
-  const title = lines[i] || '';
-  let j = i + 1;
-  while (j < lines.length && !lines[j]) j++;
-  const candidate = lines[j] || '';
-  const looksLikeLocation = candidate && candidate.length <= 60 &&
-    (/remote|hybrid|on-?site|india|bangalore|bengaluru/i.test(candidate) ||
-     (candidate.includes(',') && !candidate.endsWith('.')));
-  return {title, location: looksLikeLocation ? candidate : ''};
+
+// parseJobPaste/MAX_TITLE_LEN live in jobparse.js (loaded before this file)
+// -- pure text parsing, no DOM, so it's Node-require()-able for real tests
+// without pulling in the rest of this file.
+
+// Auto-fills Title/Location from the pasted text, but only while the user
+// hasn't typed their own value into those fields yet -- once they've
+// edited Title or Location directly, further edits to the paste never
+// clobber what they typed.
+document.getElementById('m-text').addEventListener('input', () => {
+  const titleField = document.getElementById('m-title');
+  const locationField = document.getElementById('m-location');
+  if (titleField.dataset.userEdited || locationField.dataset.userEdited) return;
+  const {title, location} = parseJobPaste(document.getElementById('m-text').value.trim());
+  if (!titleField.dataset.userEdited) titleField.value = title;
+  if (!locationField.dataset.userEdited) locationField.value = location;
+});
+for (const id of ['m-title', 'm-location']) {
+  document.getElementById(id).addEventListener('input', (e) => { e.target.dataset.userEdited = '1'; });
 }
+
 async function submitManual() {
   const raw = document.getElementById('m-text').value.trim();
-  const {title, location} = parseJobPaste(raw);
+  const title = document.getElementById('m-title').value.trim();
+  const location = document.getElementById('m-location').value.trim();
   const body = {company: document.getElementById('m-company').value.trim(), title, location,
                 url: document.getElementById('m-url').value.trim(), text: raw};
   if (!body.company || !title || !raw) {
-    document.getElementById('m-result').innerHTML = '<p style="color:var(--bad)">Company and the pasted posting are required.</p>';
+    document.getElementById('m-result').innerHTML = '<p style="color:var(--bad)">Company, title, and the pasted posting are all required.</p>';
     return;
   }
   const res = await post('/api/jobs/manual', body);
@@ -414,7 +421,7 @@ async function submitManual() {
     <div class="score-block">
       <div style="flex:1">
         <div style="font-size:12px;color:var(--ok);font-weight:600">${res.is_new ? '✓ Added to your Postings list -- close this to see it (job #' + res.job_id + ')' : '✓ Already in your Postings list as job #' + res.job_id}</div>
-        <div class="dim" style="font-size:12px;margin-top:2px">title: ${esc(title)}${location ? ' &middot; location: ' + esc(location) : ' &middot; no location line detected'}</div>
+        <div class="dim" style="font-size:12px;margin-top:2px">title: ${esc(title)}${location ? ' &middot; location: ' + esc(location) : ' &middot; no location given'}</div>
         <div class="dim" style="font-size:11.5px;margin-top:4px">Not scored yet -- run "AI-judge" to get a fit score for this posting.</div>
       </div>
     </div>
