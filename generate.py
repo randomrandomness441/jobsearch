@@ -447,6 +447,24 @@ def _drop_row(roles, projects, row_id):
     return drop_from(roles), drop_from(projects)
 
 
+# Most filesystems (ext4, APFS) cap a single path component at 255 bytes.
+# company/title have no combined length limit enforced upstream -- the manual-add
+# API only rejects a title over 200 chars on its own, and never checks company at
+# all -- so a long-but-individually-valid company + title pair made os.makedirs
+# raise OSError (ENAMETOOLONG / "File name too long") on every single attempt,
+# which looked live as a job stuck forever on "Retry generating": the failure is
+# deterministic, so retrying never helps. Reproduced: a 74-char company + a
+# 199-char title (both individually within limits) produced a 283-byte folder
+# name. Capping the slug well under the limit fixes it regardless of what
+# company/title contain.
+MAX_SLUG_LEN = 150
+
+
+def job_folder_slug(company, title):
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", f"{company}-{title}").strip("-").lower()
+    return slug[:MAX_SLUG_LEN].strip("-")
+
+
 def generate(job_id, user_email, summary, cover_letter_body, selection, out_root="data/applications"):
     """selection: the one upstream LLM call's decision (platform/server.py's
     _zai_generate_and_score) -- plain data, never computed here:
@@ -525,7 +543,7 @@ def generate(job_id, user_email, summary, cover_letter_body, selection, out_root
         for s in skills:
             skills_by_category.setdefault(s["category"], []).append(s["name"])
 
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", f"{job['company']}-{job['title']}").strip("-").lower()
+    slug = job_folder_slug(job["company"], job["title"])
     folder = os.path.join(out_root, f"{slug}-{time.strftime('%Y-%m-%d')}")
     os.makedirs(folder, exist_ok=True)
 
