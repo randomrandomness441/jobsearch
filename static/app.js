@@ -259,6 +259,7 @@ async function openJob(id) {
       <button id="jd-queue">${j.status === 'queued' ? 'Retry generating' : (j.status === 'generated' ? 'Regenerate resume + cover letter' : 'Queue for resume + cover letter')}</button>
       <button id="jd-mark-applied" ${alreadyApplied ? 'disabled' : ''} class="${alreadyApplied ? '' : 'primary'}">${alreadyApplied ? 'Applied ✓' : 'Mark as applied'}</button>
     </div>
+    <div id="jd-queue-result" style="margin-top:6px"></div>
     <div id="jd-applied-form" class="referral-form" hidden style="margin-top:10px">
       <select class="via-select">
         <option value="company_site">company site</option>
@@ -320,6 +321,8 @@ async function openJob(id) {
   });
   document.getElementById('jd-queue').onclick = async () => {
     const btn = document.getElementById('jd-queue');
+    const resultEl = document.getElementById('jd-queue-result');
+    resultEl.innerHTML = '';
     await post('/api/jobs/queue', {job_id: j.id});
     // Queuing alone used to be the whole action -- a flag with nothing
     // watching it, so nothing ever actually got generated until you asked
@@ -337,9 +340,24 @@ async function openJob(id) {
       await new Promise(r => setTimeout(r, 1500));
       const st = await api('/api/jobs/generate-queued/status');
       if (!st.running) {
-        flashCount(`Generated ${st.generated} of ${st.total} queued job(s).`);
-        openJob(id); loadJobs();
+        // st.failed already carries the real per-job error from the worker
+        // (see _run_generate_batch's track()) -- this used to go straight to
+        // a generic "Generated X of Y" count with the actual reason thrown
+        // away, so a failure just silently reverted the button to "Retry
+        // generating" with no way to tell why short of reading server logs.
+        const mine = (st.failed || []).find(f => f.job_id === j.id);
+        loadJobs();
         if (document.getElementById('view-applications').hidden === false) loadApplications();
+        if (mine) {
+          // Don't openJob() here -- it fully re-renders the panel (including
+          // this same result div), which would wipe the error the instant
+          // it's shown. Just reset the button in place instead.
+          resultEl.innerHTML = `<p style="color:var(--bad)">Generation failed: ${esc(mine.reason || 'unknown error -- see server logs')}</p>`;
+          btn.disabled = false; btn.textContent = 'Retry generating';
+        } else {
+          flashCount(`Generated ${st.generated} of ${st.total} queued job(s).`);
+          openJob(id);
+        }
         return;
       }
       btn.textContent = `Generating… ${st.done}/${st.total}`;
@@ -441,10 +459,35 @@ async function submitManual() {
       <button id="m-done" class="small">Close &amp; view in list</button>
     </div>`;
   document.getElementById('m-queue').onclick = async () => {
-    await post('/api/jobs/queue', {job_id: res.job_id});
     const btn = document.getElementById('m-queue');
-    btn.textContent = 'Queued ✓'; btn.disabled = true;
-    loadJobs();
+    const jid = res.job_id;
+    btn.disabled = true; btn.textContent = 'Starting…';
+    // This used to stop at /api/jobs/queue (which only flips the status flag)
+    // and call it done, showing "Queued ✓" with no follow-through -- nothing
+    // ever actually generated until you separately opened the job and hit
+    // "Retry generating" there. Mirrors jd-queue's real behavior now: queue,
+    // then actually kick off generate-queued and poll it to a real result.
+    await post('/api/jobs/queue', {job_id: jid});
+    const qres = await post('/api/jobs/generate-queued', {});
+    if (qres.error || !qres.candidates) { btn.textContent = 'Queued ✓'; loadJobs(); return; }
+    while (true) {
+      await new Promise(r => setTimeout(r, 1500));
+      const st = await api('/api/jobs/generate-queued/status');
+      if (!st.running) {
+        const mine = (st.failed || []).find(f => f.job_id === jid);
+        if (mine) {
+          btn.disabled = false; btn.textContent = 'Retry generating';
+          document.getElementById('m-result').insertAdjacentHTML('beforeend',
+            `<p style="color:var(--bad)">Generation failed: ${esc(mine.reason || 'unknown error -- see server logs')}</p>`);
+        } else {
+          btn.textContent = 'Generated ✓';
+        }
+        loadJobs();
+        if (document.getElementById('view-applications').hidden === false) loadApplications();
+        return;
+      }
+      btn.textContent = `Generating… ${st.done}/${st.total}`;
+    }
   };
   document.getElementById('m-done').onclick = () => { closeManual(); loadJobs(); };
   loadJobs();
