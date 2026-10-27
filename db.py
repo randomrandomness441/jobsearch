@@ -718,7 +718,12 @@ def jobs_query(user_email, status=None, eng_only=True, level_tiers=None, min_sco
         where.append("COALESCE(s.status, 'new') = ?")
         params.append(status)
     if eng_only:
-        where.append("IS_ENGINEERING_TITLE(j.title) = 1")
+        # Same reasoning as the location bypass above -- a job added by hand is
+        # wanted by definition, and a manually-typed title not matching the
+        # engineering-title regex (different phrasing, a non-dev role someone
+        # still wants tracked, etc.) made it silently invisible under the
+        # default "engineering roles only" filter, with no visible error.
+        where.append("(j.source = 'manual' OR IS_ENGINEERING_TITLE(j.title) = 1)")
     if level_tiers:
         where.append(f"SENIORITY_TIER(j.title) IN ({','.join('?' * len(level_tiers))})")
         params.extend(level_tiers)

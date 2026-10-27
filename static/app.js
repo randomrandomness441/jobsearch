@@ -416,7 +416,18 @@ async function submitManual() {
     document.getElementById('m-result').innerHTML = '<p style="color:var(--bad)">Company, title, and the pasted posting are all required.</p>';
     return;
   }
-  const res = await post('/api/jobs/manual', body);
+  let res;
+  try {
+    res = await post('/api/jobs/manual', body);
+  } catch (e) {
+    // post()/api() throws on any non-2xx response (e.g. the server's "title is
+    // implausibly long" guard) instead of returning {error}. Without this catch,
+    // that throw aborted the function right here -- before #m-result was ever
+    // written -- so a rejected add looked like nothing happened at all: no error,
+    // no job, modal just sitting there. Found live: exactly that silent failure.
+    document.getElementById('m-result').innerHTML = `<p style="color:var(--bad)">${esc(e.message)}</p>`;
+    return;
+  }
   document.getElementById('m-result').innerHTML = `
     <div class="score-block">
       <div style="flex:1">
