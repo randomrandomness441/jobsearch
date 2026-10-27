@@ -323,44 +323,55 @@ async function openJob(id) {
     const btn = document.getElementById('jd-queue');
     const resultEl = document.getElementById('jd-queue-result');
     resultEl.innerHTML = '';
-    await post('/api/jobs/queue', {job_id: j.id});
-    // Queuing alone used to be the whole action -- a flag with nothing
-    // watching it, so nothing ever actually got generated until you asked
-    // separately. Now it immediately kicks off the real draft for this job
-    // (plus anything else already queued), same async batch "Generate
-    // queued" uses, so there's real progress to see instead of a static
-    // "queued" label with nothing happening.
-    btn.disabled = true; btn.textContent = 'Starting…';
-    const res = await post('/api/jobs/generate-queued', {});
-    if (res.error || !res.candidates) {
-      openJob(id); loadJobs();
-      return;
-    }
-    while (true) {
-      await new Promise(r => setTimeout(r, 1500));
-      const st = await api('/api/jobs/generate-queued/status');
-      if (!st.running) {
-        // st.failed already carries the real per-job error from the worker
-        // (see _run_generate_batch's track()) -- this used to go straight to
-        // a generic "Generated X of Y" count with the actual reason thrown
-        // away, so a failure just silently reverted the button to "Retry
-        // generating" with no way to tell why short of reading server logs.
-        const mine = (st.failed || []).find(f => f.job_id === j.id);
-        loadJobs();
-        if (document.getElementById('view-applications').hidden === false) loadApplications();
-        if (mine) {
-          // Don't openJob() here -- it fully re-renders the panel (including
-          // this same result div), which would wipe the error the instant
-          // it's shown. Just reset the button in place instead.
-          resultEl.innerHTML = `<p style="color:var(--bad)">Generation failed: ${esc(mine.reason || 'unknown error -- see server logs')}</p>`;
-          btn.disabled = false; btn.textContent = 'Retry generating';
-        } else {
-          flashCount(`Generated ${st.generated} of ${st.total} queued job(s).`);
-          openJob(id);
-        }
+    try {
+      await post('/api/jobs/queue', {job_id: j.id});
+      // Queuing alone used to be the whole action -- a flag with nothing
+      // watching it, so nothing ever actually got generated until you asked
+      // separately. Now it immediately kicks off the real draft for this job
+      // (plus anything else already queued), same async batch "Generate
+      // queued" uses, so there's real progress to see instead of a static
+      // "queued" label with nothing happening.
+      btn.disabled = true; btn.textContent = 'Starting…';
+      const res = await post('/api/jobs/generate-queued', {});
+      if (res.error || !res.candidates) {
+        openJob(id); loadJobs();
         return;
       }
-      btn.textContent = `Generating… ${st.done}/${st.total}`;
+      while (true) {
+        await new Promise(r => setTimeout(r, 1500));
+        const st = await api('/api/jobs/generate-queued/status');
+        if (!st.running) {
+          // st.failed already carries the real per-job error from the worker
+          // (see _run_generate_batch's track()) -- this used to go straight to
+          // a generic "Generated X of Y" count with the actual reason thrown
+          // away, so a failure just silently reverted the button to "Retry
+          // generating" with no way to tell why short of reading server logs.
+          const mine = (st.failed || []).find(f => f.job_id === j.id);
+          loadJobs();
+          if (document.getElementById('view-applications').hidden === false) loadApplications();
+          if (mine) {
+            // Don't openJob() here -- it fully re-renders the panel (including
+            // this same result div), which would wipe the error the instant
+            // it's shown. Just reset the button in place instead.
+            resultEl.innerHTML = `<p style="color:var(--bad)">Generation failed: ${esc(mine.reason || 'unknown error -- see server logs')}</p>`;
+            btn.disabled = false; btn.textContent = 'Retry generating';
+          } else {
+            flashCount(`Generated ${st.generated} of ${st.total} queued job(s).`);
+            openJob(id);
+          }
+          return;
+        }
+        btn.textContent = `Generating… ${st.done}/${st.total}`;
+      }
+    } catch (e) {
+      // Every awaited call above (queue, generate-queued, the status poll) threw
+      // on a non-2xx response with NOTHING catching it -- the handler just died
+      // mid-flight with no visible change at all: button frozen on whatever text
+      // it last had (sometimes still the original label, if the very first await
+      // failed before any text was ever set), no error, nothing. Exactly the
+      // "I click it and nothing happens" symptom this was reported as.
+      resultEl.innerHTML = `<p style="color:var(--bad)">${esc(e.message)}</p>`;
+      btn.disabled = false; btn.textContent = 'Retry generating';
     }
   };
   if (!alreadyApplied) {
@@ -462,31 +473,39 @@ async function submitManual() {
     const btn = document.getElementById('m-queue');
     const jid = res.job_id;
     btn.disabled = true; btn.textContent = 'Starting…';
-    // This used to stop at /api/jobs/queue (which only flips the status flag)
-    // and call it done, showing "Queued ✓" with no follow-through -- nothing
-    // ever actually generated until you separately opened the job and hit
-    // "Retry generating" there. Mirrors jd-queue's real behavior now: queue,
-    // then actually kick off generate-queued and poll it to a real result.
-    await post('/api/jobs/queue', {job_id: jid});
-    const qres = await post('/api/jobs/generate-queued', {});
-    if (qres.error || !qres.candidates) { btn.textContent = 'Queued ✓'; loadJobs(); return; }
-    while (true) {
-      await new Promise(r => setTimeout(r, 1500));
-      const st = await api('/api/jobs/generate-queued/status');
-      if (!st.running) {
-        const mine = (st.failed || []).find(f => f.job_id === jid);
-        if (mine) {
-          btn.disabled = false; btn.textContent = 'Retry generating';
-          document.getElementById('m-result').insertAdjacentHTML('beforeend',
-            `<p style="color:var(--bad)">Generation failed: ${esc(mine.reason || 'unknown error -- see server logs')}</p>`);
-        } else {
-          btn.textContent = 'Generated ✓';
+    try {
+      // This used to stop at /api/jobs/queue (which only flips the status flag)
+      // and call it done, showing "Queued ✓" with no follow-through -- nothing
+      // ever actually generated until you separately opened the job and hit
+      // "Retry generating" there. Mirrors jd-queue's real behavior now: queue,
+      // then actually kick off generate-queued and poll it to a real result.
+      await post('/api/jobs/queue', {job_id: jid});
+      const qres = await post('/api/jobs/generate-queued', {});
+      if (qres.error || !qres.candidates) { btn.textContent = 'Queued ✓'; loadJobs(); return; }
+      while (true) {
+        await new Promise(r => setTimeout(r, 1500));
+        const st = await api('/api/jobs/generate-queued/status');
+        if (!st.running) {
+          const mine = (st.failed || []).find(f => f.job_id === jid);
+          if (mine) {
+            btn.disabled = false; btn.textContent = 'Retry generating';
+            document.getElementById('m-result').insertAdjacentHTML('beforeend',
+              `<p style="color:var(--bad)">Generation failed: ${esc(mine.reason || 'unknown error -- see server logs')}</p>`);
+          } else {
+            btn.textContent = 'Generated ✓';
+          }
+          loadJobs();
+          if (document.getElementById('view-applications').hidden === false) loadApplications();
+          return;
         }
-        loadJobs();
-        if (document.getElementById('view-applications').hidden === false) loadApplications();
-        return;
+        btn.textContent = `Generating… ${st.done}/${st.total}`;
       }
-      btn.textContent = `Generating… ${st.done}/${st.total}`;
+    } catch (e) {
+      // Same silent-death bug as jd-queue -- any non-2xx response here threw
+      // uncaught and the button just froze with no visible error at all.
+      btn.disabled = false; btn.textContent = 'Retry generating';
+      document.getElementById('m-result').insertAdjacentHTML('beforeend',
+        `<p style="color:var(--bad)">${esc(e.message)}</p>`);
     }
   };
   document.getElementById('m-done').onclick = () => { closeManual(); loadJobs(); };
