@@ -109,12 +109,14 @@ label{display:block;font-size:14px;color:var(--fg-2);margin:10px 0 4px;font-weig
 .job-badges{display:flex;gap:6px;flex-shrink:0}
 .badge{font:600 12.5px var(--sans);padding:4px 9px;border-radius:var(--radius-pill);white-space:nowrap}
 .badge-new{background:var(--panel-2);color:var(--dim)}
-.badge-queued{background:var(--warn-bg);color:var(--warn)}
-.badge-generated{background:var(--ok-bg);color:var(--ok)}
+.badge-none,.badge-cleared{background:var(--panel-2);color:var(--dim)}
+.badge-pending,.badge-retry{background:var(--warn-bg);color:var(--warn)}
+.badge-in_process{background:#f2eeff;color:var(--accent)}
+.badge-done{background:var(--ok-bg);color:var(--ok)}
+.badge-failed{background:var(--bad-bg);color:var(--bad)}
 .badge-applied{background:#eef2ff;color:#4338ca}
 .badge-tier{background:var(--bad-bg);color:var(--bad);text-transform:capitalize}
 .badge-llm{background:#f2eeff;color:var(--accent)}
-.badge-estimate{background:var(--panel-2);color:var(--dim)}
 .badge-stale{background:var(--warn-bg);color:var(--warn)}
 
 #pagination:not([hidden]){display:flex;align-items:center;justify-content:center;gap:14px;padding:18px 0}
@@ -290,3 +292,4 @@ button.primary{box-shadow:0 1px 2px rgba(109,74,255,.25)}
 @media (max-width:420px){
   #company-cards:not([hidden]){grid-template-columns:1fr}
 }
+.referral-form[hidden]{display:none}

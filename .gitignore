@@ -16,3 +16,10 @@ data/jobsearch.db
 data/applications/
 data/validate_results.jsonl
 data/__pycache__/
+
+# New design: the working DB, each user's generated files, and each user's
+# master document are all personal data.
+data/app.db*
+data/files/
+data/master/
+.DS_Store

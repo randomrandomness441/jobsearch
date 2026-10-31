@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sends the "a job crossed your fit-score threshold" notification via
+"""Sends the "your resume and cover letter are ready" notification via
 Telegram instead of email -- a bot token authenticates as a separate bot
 identity, not your real account, so a leaked/misused token can't send as
 you to your real contacts the way an email password could.
@@ -37,60 +37,11 @@ def _call(method, payload, bot_token=None):
         return None, str(e)
 
 
-def send_job_alert(job, generate_url, view_url, bot_token=None, chat_id=None):
-    """job: a real jobsdb row (needs title, company, url, llm_score).
-    generate_url/view_url: the two signed one-click links. bot_token/
-    chat_id: this recipient's own Telegram config (see server.py's
-    per-user telegram_config table) -- falls back to the env-var admin
-    bot when omitted, for any caller that hasn't been given a specific
-    user's config. Returns (ok, error_or_None) -- never raises, so one
-    bad send doesn't take the whole poll run down.
-
-    Deliberately short: title, company, ATS score, apply link -- the full
-    fit-reasoning and job description used to be inlined here and made
-    every message huge; that's now one tap away via view_url instead."""
-    bot_token = bot_token or TELEGRAM_BOT_TOKEN
-    chat_id = chat_id or TELEGRAM_CHAT_ID
-    if not bot_token or not chat_id:
-        return False, "no Telegram bot_token/chat_id for this recipient"
-
-    text = (
-        f"*ATS score: {job['llm_score']:.0f}*\n"
-        f"{job['title']} @ {job['company']}\n\n"
-        f"[Apply here]({job.get('url', '')})"
-    )
-    # Two inline buttons -- tap to act, no typing, nothing revealed until
-    # you choose to open it. Both URLs ARE the auth (HMAC-signed, see
-    # server.py's _sign_job_user) -- Telegram never sees or needs a
-    # credential for either.
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
-        "reply_markup": {
-            "inline_keyboard": [
-                [{"text": "View JD", "url": view_url},
-                 {"text": "Generate resume + cover letter", "url": generate_url}],
-            ]
-        },
-    }
-    result, err = _call("sendMessage", payload, bot_token=bot_token)
-    if err:
-        return False, err
-    if not result.get("ok"):
-        return False, f"Telegram rejected the message: {result}"
-    return True, None
-
-
 def send_generation_complete(job, resume_url, cover_url, bot_token=None, chat_id=None):
-    """Follow-up message once an async "Generate now" click actually finishes
-    -- the real fix for a generate that used to hang the original click for
-    1-3+ minutes. Both URLs are HMAC-signed single-file download links (see
-    server.py's _serve_signed_job_file), not a login-gated app page, so they
-    open directly for whoever's on the other end of this chat. bot_token/
-    chat_id: this user's own Telegram config, falling back to the env-var
-    admin bot when omitted."""
+    """The resume and cover letter for one job are ready. Both URLs are signed,
+    expiring download links (links.py), not a login-gated page, so they open
+    directly from this chat. bot_token/chat_id: this user's own Telegram
+    config, falling back to the env-var admin bot when omitted."""
     bot_token = bot_token or TELEGRAM_BOT_TOKEN
     chat_id = chat_id or TELEGRAM_CHAT_ID
     if not bot_token or not chat_id:
@@ -116,10 +67,8 @@ def send_generation_complete(job, resume_url, cover_url, bot_token=None, chat_id
 
 
 def send_generation_failed(job, reason, bot_token=None, chat_id=None):
-    """The other half of send_generation_complete -- an async generate can
-    fail same as a synchronous one always could, and that needs to actually
-    reach the person who clicked, not just sit in server logs nobody's
-    watching in the moment."""
+    """A job used up its attempts and failed -- this has to reach the person,
+    not sit in a log nobody is watching."""
     bot_token = bot_token or TELEGRAM_BOT_TOKEN
     chat_id = chat_id or TELEGRAM_CHAT_ID
     if not bot_token or not chat_id:
@@ -155,7 +104,7 @@ def send_test_message(bot_token, chat_id):
 
 def _print_chat_id():
     """Run once, by hand, after messaging your bot -- prints the chat id
-    to put in TELEGRAM_CHAT_ID. Not called by poll_and_notify.py."""
+    to put in TELEGRAM_CHAT_ID."""
     result, err = _call("getUpdates", {})
     if err:
         print(f"error: {err}")

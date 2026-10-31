@@ -17,7 +17,7 @@
 
 <div id="guest-banner" hidden>
   You're browsing a read-only preview. Ask the admin to whitelist your account for full access
-  (fetch, AI-judge, generate resumes, edit your profile).
+  (fetch, generate resumes, edit your profile).
 </div>
 
 <div id="app">
@@ -31,23 +31,14 @@
     <div id="subnav-spacer"></div>
     <button id="btn-manual">+ Add job manually</button>
     <button id="btn-refetch">Fetch new</button>
-    <button id="btn-llm-backfill" title="The only place an AI judgment happens -- never automatic. Judges target-title India/Bangalore postings that are new or stale (point bank changed since last judged).">AI-judge</button>
-    <label>last <input id="f-judge-days" type="number" min="0" value="14" class="w-xs" title="How many days back AI-judge looks, independent of the list filter below. Blank or 0 means any time fetched."> days</label>
-    <details id="more-actions">
-      <summary>More &hellip;</summary>
-      <div class="more-menu">
-        <label>fetched within <input id="f-clear-days" type="number" min="0" value="14" class="w-xs" title="How many days back to clear, independent of the list filter and AI-judge's own day count. Blank or 0 means any time fetched."> days</label>
-        <button id="btn-clear-llm" title="Wipes AI scores for postings fetched in the window above. Does not re-judge -- click AI-judge afterward for that (it already picks up anything not yet judged).">Clear scores</button>
-      </div>
-    </details>
-    <span id="judge-tracker" class="dim"></span>
+    <span id="queue-tracker" class="dim"></span>
   </div>
 
   <!-- ── postings view: flat list by default, sorted by score ────────── -->
   <div id="view-postings" class="view">
     <div id="filters">
       <input id="f-search" type="text" placeholder="search company or title…">
-      <label>min score <input id="f-minscore" type="number" min="0" max="100" value="0" class="w-sm" title="Only applies to AI-judged postings -- an unjudged posting has no score yet, so this filter can't touch it"></label>
+      <label>min score <input id="f-minscore" type="number" min="0" max="100" value="0" class="w-sm" title="Only applies to postings that have a score -- one without a score yet always shows"></label>
       <label><input id="f-eng" type="checkbox" checked> engineering roles only</label>
       <select id="f-level" title="Based on your point bank: 4.5 yrs, no people-management experience recorded">
         <option value="core" selected>SDE / Senior (your real target)</option>
@@ -62,9 +53,13 @@
       </select>
       <select id="f-status">
         <option value="">any status</option>
-        <option value="new">new</option>
-        <option value="queued">queued</option>
-        <option value="generated">generated</option>
+        <option value="none">no resume yet</option>
+        <option value="pending">pending</option>
+        <option value="in_process">in process</option>
+        <option value="retry">retry</option>
+        <option value="done">done</option>
+        <option value="failed">failed</option>
+        <option value="cleared">cleared</option>
       </select>
       <button id="btn-group-by-company" class="small">Group by company</button>
       <span id="f-count" class="dim"></span>
@@ -100,8 +95,8 @@
     </div>
     <p class="dim help-text">
       Every real gap flagged across your scored postings, grouped by what they actually mean
-      (not by exact wording), most-common first. Fix something in your master doc, then rejudge
-      just the postings that flagged it to see if it's actually closed.
+      (not by exact wording), most-common first. Fix something in your master doc, then regenerate
+      the postings that flagged it to see if it's actually closed.
     </p>
     <div id="gaps-list"></div>
   </div>
@@ -212,7 +207,7 @@
     <p class="dim">Paste the whole posting -- title and location are guessed from the first couple
       of lines and filled in below; check the Title field and fix it if the guess looks wrong
       (e.g. too long, or includes part of the description) before adding. Dedup runs on submit;
-      run AI-judge afterward to get a fit score.</p>
+      the resume and cover letter are generated right after, ahead of the automatic ones.</p>
     <label>Company <input id="m-company" type="text"></label>
     <label>Paste job posting <textarea id="m-text" rows="14" placeholder="Software Development Engineer II&#10;Remote (India)&#10;About Us...&#10;..."></textarea></label>
     <label>Title <input id="m-title" type="text" placeholder="auto-filled from the paste above -- edit if it looks wrong"></label>

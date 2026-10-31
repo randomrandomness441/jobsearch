@@ -7,9 +7,9 @@ pages, not paywalled:
   https://developers.ashbyhq.com/docs/public-job-posting-api  (api.ashbyhq.com)
 
 Target companies live in companies.py, not here -- edit that file to add or
-fix a slug. Every posting goes through db.jobs_add(), which deduplicates by
-url and by content hash, so re-running this on a schedule is safe: already-
-seen postings come back as (existing_id, is_new=False), nothing doubles up.
+fix a slug. Every posting goes through db.jobs_add(), which is unique on (company,
+the ATS's own listing id), so re-running this on a schedule is safe: an
+already-seen posting only gets its last_seen_ts bumped, nothing doubles up.
 """
 
 import concurrent.futures
@@ -88,6 +88,7 @@ def fetch_greenhouse(slug):
         # still correctly rejects, same location field either way.
         description_raw = _clean_html(raw) if is_target_location(location, raw) else raw
         out.append({
+            "external_id": str(j["id"]),
             "title": j["title"],
             "url": j.get("absolute_url", ""),
             "description_raw": description_raw,
@@ -129,7 +130,8 @@ def fetch_lever(slug):
             # cleaning (and the lists work) entirely.
             desc = plain or raw
         created = j.get("createdAt")  # epoch milliseconds
-        out.append({"title": j.get("text", ""), "url": j.get("hostedUrl", ""), "description_raw": desc,
+        out.append({"external_id": str(j["id"]), "title": j.get("text", ""), "url": j.get("hostedUrl", ""),
+                     "description_raw": desc,
                      "location": location,
                      "posted_ts": created / 1000 if created else None})
     return out
@@ -144,7 +146,8 @@ def fetch_ashby(slug):
         plain = j.get("descriptionPlain")
         # same reasoning as fetch_greenhouse above
         desc = (plain or _clean_html(raw)) if is_target_location(location, plain or raw) else (plain or raw)
-        out.append({"title": j.get("title", ""), "url": j.get("jobUrl", ""), "description_raw": desc,
+        out.append({"external_id": str(j["id"]), "title": j.get("title", ""), "url": j.get("jobUrl", ""),
+                     "description_raw": desc,
                      "location": location,
                      "posted_ts": _parse_iso(j.get("publishedAt"))})
     return out
@@ -164,6 +167,8 @@ def _fetch_one(row):
 
 
 def main():
+    """Fetch every company, store what's new, bump last_seen on what's already
+    tracked. Returns {"new", "seen", "errors"}."""
     total_new, total_dup, total_err, total_skip_loc, total_skip_age = 0, 0, 0, 0, 0
     cutoff = time.time() - MAX_POSTING_AGE_DAYS * 86400
 
@@ -205,7 +210,7 @@ def main():
             if posted_ts is not None and posted_ts < cutoff:
                 skip_age += 1
                 continue
-            _, is_new = db.jobs_add(ats, name, p["title"], p["url"], p["description_raw"],
+            _, is_new = db.jobs_add(ats, p["external_id"], name, p["title"], p["url"], p["description_raw"],
                                      p.get("location", ""), posted_ts)
             if is_new:
                 new_here += 1
@@ -222,6 +227,7 @@ def main():
           f"{total_skip_loc} skipped (outside India, never saved), "
           f"{total_skip_age} skipped (older than {MAX_POSTING_AGE_DAYS}d, never saved), "
           f"{total_err} sources errored")
+    return {"new": total_new, "seen": total_dup, "errors": total_err}
 
 
 if __name__ == "__main__":

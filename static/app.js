@@ -12,17 +12,25 @@ function post(path, body) {
 function esc(s) { return (s || '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 function scoreClass(s) { return s == null ? 'score-lo' : s >= 80 ? 'score-hi' : s >= 60 ? 'score-mid' : 'score-lo'; }
 function fmtDate(ts) { return ts ? new Date(ts * 1000).toLocaleDateString() : ''; }
-// folder_path comes back from the DB as the real on-disk path under
-// jobsearch/data/applications/ -- one place to strip that prefix down to
-// what the /applications/ URL route expects, instead of the same literal
-// string repeated at every call site (the kind of duplicated assumption
-// that broke silently the last time this path moved).
-function appDocUrl(folderPath, filename) {
-  return `/applications/${encodeURIComponent(folderPath.replace('data/applications/', ''))}/${filename}`;
+// Files come from one route; the server finds the folder from the user's own
+// analysis row, so the URL only names the job and which file.
+function docUrl(jobId, kind) { return `/api/jobs/download?job_id=${jobId}&kind=${kind}`; }
+const STATUS_TITLES = {
+  none: 'No resume or cover letter yet',
+  pending: 'Waiting in line',
+  in_process: 'Being generated right now',
+  retry: 'Failed an attempt, will try again',
+  done: 'Resume and cover letter ready',
+  failed: 'Gave up after 3 attempts',
+  cleared: 'Cleared -- click Regenerate to make it again',
+};
+function statusChip(j) {
+  const detail = j.status === 'failed' || j.status === 'retry' ? (j.error_msg || j.error_kind || '') : '';
+  const attempts = (j.status === 'retry' || j.status === 'failed' || j.status === 'in_process') && j.attempts ? ` ${j.attempts}/3` : '';
+  const title = [STATUS_TITLES[j.status] || '', detail].filter(Boolean).join(' -- ');
+  return `<span class="badge badge-${j.status}" title="${esc(title)}">${esc(j.status.replace('_', ' '))}${attempts}</span>`;
 }
-// missing: [{gap, why, example}, ...] -- same shape whether it came from a
-// score-only pass (job.llm_missing) or a real generation
-// (application.ats_estimate.missing), so one renderer covers both.
+// missing: [{gap, why, example}, ...] from the scoring step of an analysis.
 function _missingHtml(missing) {
   if (!missing || !missing.length) return '';
   return `<div style="margin-top:8px">${missing.map(m => `
@@ -31,42 +39,6 @@ function _missingHtml(missing) {
         ${m.example ? `<br>example that would close it: ${esc(m.example)}` : ''}
       </div>`).join('')}</div>`;
 }
-// projects: [{row_id, name, worth_including, reason}, ...] -- advisory
-// only, never auto-included in the resume. The button is the only way a
-// project actually lands on the page (wired separately, see openJob()).
-function _projectsHtml(projects) {
-  if (!projects || !projects.length) return '';
-  // One card per PROJECT, not per point-bank row -- a project with
-  // several facts on file (e.g. 3 rows under "Kapitsa") used to render as
-  // 3 separate "projects" with the same name, each with its own button.
-  // Grouped by name here instead; the button carries every row id
-  // belonging to that project, so "Add to resume" forces the whole
-  // project in, not just whichever fact happened to list first.
-  const byName = new Map();
-  for (const p of projects) {
-    if (!byName.has(p.name)) byName.set(p.name, []);
-    byName.get(p.name).push(p);
-  }
-  const cards = [...byName.entries()].map(([name, rows]) => {
-    const anyWorthIt = rows.some(p => p.worth_including);
-    const rowIds = rows.map(p => p.row_id).join(',');
-    const reasonLines = rows.map(p =>
-      `<div>${p.worth_including ? '✓' : '–'} ${esc(p.reason || '')}</div>`).join('');
-    return `
-      <div class="dim" style="font-size:12px;margin-top:6px;display:flex;align-items:flex-start;gap:8px">
-        <span style="flex:1">
-          <b style="color:${anyWorthIt ? 'var(--ok)' : 'var(--dim)'}">${esc(name)}</b>
-          ${reasonLines}
-        </span>
-        <button class="small jd-add-project" data-row-ids="${rowIds}">Add to resume</button>
-      </div>`;
-  }).join('');
-  return `<div style="margin-top:8px">
-    <div class="dim" style="font-size:12px;font-weight:600">Projects (not on the resume unless you add one)</div>
-    ${cards}
-  </div>`;
-}
-
 const STATUS_FLOW = ['phone_screen', 'interview', 'offer', 'rejected', 'ghosted', 'withdrawn'];
 let currentPage = 1;
 let currentCompany = null;      // set = flat list scoped to one company (via a card click)
@@ -159,34 +131,18 @@ async function loadJobs() {
   for (const j of data.jobs) {
     const row = document.createElement('div');
     row.className = 'job-row';
-    // llm_score is the only score there is pre-generation -- regex only
-    // classifies title/seniority/location, it doesn't rate fit. A posting
-    // with no score yet just hasn't been through AI-judge.
-    const isLlm = j.llm_score != null;
-    const score = isLlm ? Math.round(j.llm_score) : '–';
+    const score = j.score != null ? Math.round(j.score) : '–';
     const tierNote = ['staff', 'senior_staff', 'manager'].includes(j.seniority_tier)
       ? `<span class="badge badge-tier">${j.seniority_tier.replace('_', ' ')}</span>` : '';
-    const provenanceNote = isLlm
-      ? `<span class="badge badge-llm" title="${esc(j.llm_reason || '')}">AI-judged</span>`
-      : `<span class="badge badge-estimate" title="Not yet run through AI-judge">not judged</span>`;
-    // Judged, but your master doc (point bank/skills/profile) changed since
-    // -- this score no longer reflects your current profile. Only clears
-    // when THIS posting is individually re-judged (AI-judge picks up every
-    // stale posting automatically, no separate action needed).
-    const staleNote = j.stale
-      ? '<span class="badge badge-stale" title="Your master doc changed since this was judged -- re-run AI-judge to refresh">stale</span>' : '';
     row.innerHTML = `
-      <div class="job-score ${scoreClass(j.llm_score)}" title="${isLlm ? esc(j.llm_reason || '') : 'Not yet judged'}">${score}</div>
+      <div class="job-score ${scoreClass(j.score)}" title="${j.score != null ? esc(j.reason || '') : 'Not scored yet'}">${score}</div>
       <div class="job-main">
         <div class="job-title">${esc(j.title)}</div>
-        <div class="job-company">${esc(j.company)} · ${esc(j.source)} · ${fmtDate(j.fetched_ts)}</div>
+        <div class="job-company">${esc(j.company)} · ${esc(j.source)} · ${fmtDate(j.first_seen_ts)}</div>
       </div>
       <div class="job-badges">
-        ${provenanceNote}
-        ${staleNote}
         ${tierNote}
-        ${j.applied ? '<span class="badge badge-applied">applied</span>' : ''}
-        <span class="badge badge-${j.status}">${esc(j.status)}</span>
+        ${statusChip(j)}
       </div>`;
     row.onclick = () => openJob(j.id);
     list.appendChild(row);
@@ -198,68 +154,69 @@ async function loadJobs() {
   document.getElementById('p-next').disabled = data.page >= data.total_pages;
 }
 
-async function openJob(id) {
-  const data = await api('/api/jobs/detail?id=' + id);
-  const j = data.job, apps = data.applications;
-  const panel = document.getElementById('job-detail');
-  const alreadyApplied = apps.some(a => a.status !== 'generated');
-  // Two shapes of application row: real generated materials (resume/cover
-  // letter links + ATS estimate), or a quick "I already applied elsewhere"
-  // row (empty folder_path -- no materials came out of this tool for it).
-  const appsHtml = apps.length ? apps.map(a => a.folder_path ? `
-    <div class="app-entry">
-      <div class="app-entry-meta">
-        <span class="badge badge-llm" title="${esc(a.ats_estimate.reason || '')}">ATS ${a.ats_estimate.score}</span>
-        ${a.ats_estimate.rendered_pages ? `<span class="badge badge-new">${a.ats_estimate.rendered_pages}p</span>` : ''}
-        <span class="dim">generated ${fmtDate(a.generated_ts)}</span>
-        <span class="badge badge-${a.status === 'generated' ? 'new' : 'generated'}">${esc(a.status)}</span>
-      </div>
-      ${a.ats_estimate.reason ? `<div style="font-size:13px;margin-top:4px">${esc(a.ats_estimate.reason)}</div>` : ''}
-      ${(a.ats_estimate.requirements || []).length ? `
-      <div class="kw-list" style="margin-top:6px">
-        ${a.ats_estimate.requirements.map(r => {
-          const cls = r.presence === 'no' ? 'kw-no' : (r.depth === 'quantified' ? 'kw-yes' : 'kw-weak');
-          const pts = (r.weight != null && r.earned != null) ? ` (${r.earned}/${r.weight} pts)` : '';
-          const label = r.requirement + (r.importance === 'required' ? '' : ' (nice-to-have)') + pts;
-          return `<span class="kw ${cls}" title="${esc(r.presence)}/${esc(r.depth)}">${esc(label)}</span>`;
-        }).join('')}
-      </div>` : ''}
-      ${_missingHtml(a.ats_estimate.missing)}
+let jobPoll = null;
+function fmtDur(ms) { return ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms'; }
+
+function _analysisHtml(job, a) {
+  if (!a) return '<p class="dim" style="margin-top:8px">No resume or cover letter yet.</p>';
+  const row = {status: a.status, attempts: a.attempts, error_kind: a.error_kind, error_msg: a.error_msg};
+  const times = [a.started_ts && `started ${new Date(a.started_ts * 1000).toLocaleString()}`,
+                 a.finished_ts && `finished ${new Date(a.finished_ts * 1000).toLocaleString()}`].filter(Boolean).join(' · ');
+  let html = `<div class="app-entry"><div class="app-entry-meta">${statusChip(row)}
+      ${a.score != null ? `<span class="badge badge-llm">fit ${Math.round(a.score)}</span>` : ''}
+      ${a.provider ? `<span class="badge badge-new">${esc(a.provider)}</span>` : ''}
+      <span class="dim">${esc(times)}</span></div>`;
+  if (a.error_msg && (a.status === 'failed' || a.status === 'retry')) {
+    html += `<p style="color:var(--bad);margin-top:6px">${esc(a.error_kind)}: ${esc(a.error_msg)}</p>`;
+  }
+  if (a.status === 'done') {
+    html += `
+      ${a.reason ? `<div style="font-size:13px;margin-top:4px">${esc(a.reason)}</div>` : ''}
+      ${a.requirements.length ? `<div class="kw-list" style="margin-top:6px">${a.requirements.map(r => {
+        const cls = r.presence === 'no' ? 'kw-no' : (r.depth === 'quantified' ? 'kw-yes' : 'kw-weak');
+        const label = r.requirement + (r.importance === 'required' ? '' : ' (nice-to-have)') + ` (${r.earned}/${r.weight} pts)`;
+        return `<span class="kw ${cls}" title="${esc(r.presence)}/${esc(r.depth)}">${esc(label)}</span>`;
+      }).join('')}</div>` : ''}
+      ${_missingHtml(a.gaps)}
       <div class="doc-links">
-        <a class="doc-link" href="${appDocUrl(a.folder_path, 'resume.pdf')}">Resume <span class="ext">PDF</span></a>
-        <a class="doc-link alt" href="${appDocUrl(a.folder_path, 'resume.docx')}">.docx</a>
-        <a class="doc-link" href="${appDocUrl(a.folder_path, 'cover_letter.pdf')}">Cover letter <span class="ext">PDF</span></a>
-        <a class="doc-link alt" href="${appDocUrl(a.folder_path, 'cover_letter.docx')}">.docx</a>
-      </div>
-    </div>` : `
-    <div class="app-entry-applied">
-      Marked applied ${fmtDate(a.applied_ts)} via ${esc(a.applied_via || '?')}${a.referral_name ? ' · referral: ' + esc(a.referral_name) : ''}
-      — no materials generated through this tool — status: <b>${esc(a.status)}</b>
-    </div>`).join('') : '<p class="dim" style="margin-top:8px">Not generated yet.</p>';
+        <a class="doc-link" href="${docUrl(job.id, 'resume')}">Resume <span class="ext">PDF</span></a>
+        <a class="doc-link alt" href="${docUrl(job.id, 'resume_docx')}">.docx</a>
+        <a class="doc-link" href="${docUrl(job.id, 'cover')}">Cover letter <span class="ext">PDF</span></a>
+        <a class="doc-link alt" href="${docUrl(job.id, 'cover_docx')}">.docx</a>
+      </div>`;
+  }
+  if (a.steps.length) {
+    html += `<details style="margin-top:8px"><summary class="dim" style="font-size:12px">timings (${a.steps.length} step${a.steps.length === 1 ? '' : 's'})</summary>
+      <table style="font-size:12px;margin-top:4px">${a.steps.map(st => `<tr>
+        <td>try ${st.attempt}</td><td>${esc(st.step)}</td><td>${fmtDur(st.duration_ms)}</td>
+        <td>${st.prompt_tokens != null ? `${st.prompt_tokens} in / ${st.completion_tokens} out${st.cached_tokens ? ` / ${st.cached_tokens} cached` : ''}` : ''}</td>
+        <td>${st.ok ? '' : esc(st.error || 'failed')}</td></tr>`).join('')}</table></details>`;
+  }
+  return html + '</div>';
+}
+
+async function openJob(id) {
+  clearTimeout(jobPoll);
+  const data = await api('/api/jobs/detail?id=' + id);
+  const j = data.job, a = data.analysis, app = data.application;
+  const panel = document.getElementById('job-detail');
+  const status = a ? a.status : 'none';
+  const active = status === 'pending' || status === 'in_process' || status === 'retry';
+  const form = document.getElementById('jd-applied-form');
+  const formOpen = form && !form.hidden && !panel.hidden;
+  if (formOpen) return;            // a background refresh must not wipe a half-filled form
 
   panel.innerHTML = `
     <button class="close-x" onclick="closeJob()">✕</button>
     <div class="jd-title">${esc(j.title)}</div>
     <div class="jd-company">${esc(j.company)} ${j.url ? `· <a href="${esc(j.url)}" target="_blank">posting ↗</a>` : ''}</div>
-    ${j.llm_score != null ? `
-    <div class="score-block" style="border:1px solid var(--accent)">
-      <div><div class="num">${Math.round(j.llm_score)}</div><div class="dim" style="font-size:13px">AI fit</div></div>
-      <div style="flex:1">
-        ${j.stale ? '<div class="badge badge-stale" style="margin-bottom:4px">stale -- your master doc changed since this was judged, rescore to refresh</div>' : ''}
-        <div style="font-size:14px">${esc(j.llm_reason || '')}</div>
-        ${_missingHtml(j.llm_missing)}
-        ${_projectsHtml(j.llm_projects)}
-      </div>
-    </div>` : `
-    <div class="score-block">
-      <div class="dim" style="font-size:14px">Not yet AI-judged -- run "AI-judge", or rescore this one posting, to get a fit score.</div>
-    </div>`}
-    <div class="row" style="justify-content:flex-start;gap:8px">
-      <button id="jd-rescore" class="small">${j.llm_score != null ? 'Rescore this posting' : 'Score this posting'}</button>
-      <button id="jd-queue">${j.status === 'queued' ? 'Retry generating' : (j.status === 'generated' ? 'Regenerate resume + cover letter' : 'Queue for resume + cover letter')}</button>
-      <button id="jd-mark-applied" ${alreadyApplied ? 'disabled' : ''} class="${alreadyApplied ? '' : 'primary'}">${alreadyApplied ? 'Applied ✓' : 'Mark as applied'}</button>
+    <div class="row" style="justify-content:flex-start;gap:8px;margin-top:10px">
+      <button id="jd-regen" ${status === 'in_process' ? 'disabled' : ''} class="${status === 'none' || status === 'cleared' ? 'primary' : ''}">${
+        status === 'none' ? 'Generate resume + cover letter' : status === 'cleared' ? 'Generate again' : 'Regenerate'}</button>
+      <button id="jd-clear" ${status === 'in_process' || status === 'none' || status === 'cleared' ? 'disabled' : ''}>Clear</button>
+      <button id="jd-mark-applied" ${app ? 'disabled' : ''} class="${app ? '' : 'primary'}">${app ? 'Applied ✓' : 'Mark as applied'}</button>
     </div>
-    <div id="jd-queue-result" style="margin-top:6px"></div>
+    <div id="jd-result" style="margin-top:6px"></div>
     <div id="jd-applied-form" class="referral-form" hidden style="margin-top:10px">
       <select class="via-select">
         <option value="company_site">company site</option>
@@ -272,109 +229,27 @@ async function openJob(id) {
       <input class="referral-note" type="text" placeholder="referral note (optional)">
       <button id="jd-confirm-applied" class="primary small">Confirm</button>
     </div>
-    <h3 style="font-size:15px;margin-top:18px">Generated materials</h3>
-    ${appsHtml}
+    <h3 style="font-size:15px;margin-top:18px">Resume + cover letter</h3>
+    ${_analysisHtml(j, a)}
     <h3 style="font-size:15px;margin-top:18px">Job description</h3>
     <div class="jd-body">${esc(j.description_raw)}</div>
   `;
-  document.getElementById('jd-rescore').onclick = async () => {
-    const btn = document.getElementById('jd-rescore');
-    btn.disabled = true; btn.textContent = 'Scoring…';
-    const res = await post('/api/jobs/rescore', {job_id: j.id});
-    if (res.error) { flashCount(res.error); btn.disabled = false; btn.textContent = 'Rescore this posting'; return; }
-    openJob(id); loadJobs();
-  };
-  // Delegated -- one "Add to resume" button per project, rendered fresh
-  // each time by _projectsHtml. Forces this project into a full
-  // regenerate (fresh summary + cover letter + content selection) via
-  // /api/jobs/generate-with-project; the project is advisory-only
-  // otherwise, this is the only thing that actually puts it on the page.
-  panel.querySelectorAll('.jd-add-project').forEach(btn => {
-    btn.onclick = async () => {
-      const rowIds = btn.dataset.rowIds.split(',').map(Number);
-      btn.disabled = true; btn.textContent = 'Adding…';
-      const res = await post('/api/jobs/generate-with-project', {job_id: j.id, project_ids: rowIds});
-      if (res.error) { flashCount(res.error); btn.disabled = false; btn.textContent = 'Add to resume'; return; }
-      // Async now -- the server enqueues the real regenerate (3 LLM calls plus
-      // rendering, can take a couple of minutes) onto one shared worker instead of
-      // blocking this request, so the response here is just "started"/"already_running",
-      // not the finished result. Poll the same way the "Generate queued" batch flow
-      // already does, and just show the files once the page refreshes -- no separate
-      // notification needed here, the person's already looking at this page.
-      while (true) {
-        await new Promise(r => setTimeout(r, 1500));
-        const st = await api(`/api/jobs/generate-status?job_id=${j.id}`);
-        if (st.state === 'done') {
-          flashCount('Project added -- resume regenerated.');
-          break;
-        }
-        if (st.state === 'failed') {
-          flashCount(st.error || 'Generation failed -- see server logs');
-          break;
-        }
-        btn.textContent = st.state === 'running' ? 'Generating…' : 'Queued…';
-      }
-      btn.disabled = false; btn.textContent = 'Add to resume';
-      openJob(id); loadJobs();
-      if (document.getElementById('view-applications').hidden === false) loadApplications();
-    };
-  });
-  document.getElementById('jd-queue').onclick = async () => {
-    const btn = document.getElementById('jd-queue');
-    const resultEl = document.getElementById('jd-queue-result');
-    resultEl.innerHTML = '';
-    try {
-      await post('/api/jobs/queue', {job_id: j.id});
-      // Queuing alone used to be the whole action -- a flag with nothing
-      // watching it, so nothing ever actually got generated until you asked
-      // separately. Now it immediately kicks off the real draft for this job
-      // (plus anything else already queued), same async batch "Generate
-      // queued" uses, so there's real progress to see instead of a static
-      // "queued" label with nothing happening.
-      btn.disabled = true; btn.textContent = 'Starting…';
-      const res = await post('/api/jobs/generate-queued', {});
-      if (res.error || !res.candidates) {
+  const act = (btnId, path) => {
+    document.getElementById(btnId).onclick = async () => {
+      const btn = document.getElementById(btnId);
+      btn.disabled = true;
+      try {
+        await post(path, {job_id: j.id});
         openJob(id); loadJobs();
-        return;
+      } catch (e) {
+        document.getElementById('jd-result').innerHTML = `<p style="color:var(--bad)">${esc(e.message)}</p>`;
+        btn.disabled = false;
       }
-      while (true) {
-        await new Promise(r => setTimeout(r, 1500));
-        const st = await api('/api/jobs/generate-queued/status');
-        if (!st.running) {
-          // st.failed already carries the real per-job error from the worker
-          // (see _run_generate_batch's track()) -- this used to go straight to
-          // a generic "Generated X of Y" count with the actual reason thrown
-          // away, so a failure just silently reverted the button to "Retry
-          // generating" with no way to tell why short of reading server logs.
-          const mine = (st.failed || []).find(f => f.job_id === j.id);
-          loadJobs();
-          if (document.getElementById('view-applications').hidden === false) loadApplications();
-          if (mine) {
-            // Don't openJob() here -- it fully re-renders the panel (including
-            // this same result div), which would wipe the error the instant
-            // it's shown. Just reset the button in place instead.
-            resultEl.innerHTML = `<p style="color:var(--bad)">Generation failed: ${esc(mine.reason || 'unknown error -- see server logs')}</p>`;
-            btn.disabled = false; btn.textContent = 'Retry generating';
-          } else {
-            flashCount(`Generated ${st.generated} of ${st.total} queued job(s).`);
-            openJob(id);
-          }
-          return;
-        }
-        btn.textContent = `Generating… ${st.done}/${st.total}`;
-      }
-    } catch (e) {
-      // Every awaited call above (queue, generate-queued, the status poll) threw
-      // on a non-2xx response with NOTHING catching it -- the handler just died
-      // mid-flight with no visible change at all: button frozen on whatever text
-      // it last had (sometimes still the original label, if the very first await
-      // failed before any text was ever set), no error, nothing. Exactly the
-      // "I click it and nothing happens" symptom this was reported as.
-      resultEl.innerHTML = `<p style="color:var(--bad)">${esc(e.message)}</p>`;
-      btn.disabled = false; btn.textContent = 'Retry generating';
-    }
+    };
   };
-  if (!alreadyApplied) {
+  act('jd-regen', '/api/jobs/regenerate');
+  act('jd-clear', '/api/jobs/clear');
+  if (!app) {
     document.getElementById('jd-mark-applied').onclick = () => {
       document.getElementById('jd-applied-form').hidden = false;
     };
@@ -393,8 +268,11 @@ async function openJob(id) {
   document.getElementById('overlay').hidden = false;
   panel.hidden = false;
   document.getElementById('overlay').onclick = closeJob;
+  // The worker moves it along on its own; keep the panel and list in step.
+  if (active) jobPoll = setTimeout(() => { if (!panel.hidden) { openJob(id); loadJobs(); } }, 3000);
 }
 function closeJob() {
+  clearTimeout(jobPoll);
   document.getElementById('overlay').hidden = true;
   document.getElementById('job-detail').hidden = true;
 }
@@ -457,60 +335,21 @@ async function submitManual() {
     document.getElementById('m-result').innerHTML = `<p style="color:var(--bad)">${esc(e.message)}</p>`;
     return;
   }
+  const note = !res.is_new ? 'Already in your Postings list'
+    : res.queued ? 'Added -- resume + cover letter are queued and will be generated next'
+    : 'Added';
   document.getElementById('m-result').innerHTML = `
     <div class="score-block">
       <div style="flex:1">
-        <div style="font-size:12px;color:var(--ok);font-weight:600">${res.is_new ? '✓ Added to your Postings list -- close this to see it (job #' + res.job_id + ')' : '✓ Already in your Postings list as job #' + res.job_id}</div>
+        <div style="font-size:12px;color:var(--ok);font-weight:600">✓ ${note} (job #${res.job_id})</div>
         <div class="dim" style="font-size:12px;margin-top:2px">title: ${esc(title)}${location ? ' &middot; location: ' + esc(location) : ' &middot; no location given'}</div>
-        <div class="dim" style="font-size:11.5px;margin-top:4px">Not scored yet -- run "AI-judge" to get a fit score for this posting.</div>
       </div>
     </div>
     <div class="row" style="justify-content:flex-start;margin-top:10px">
-      <button id="m-queue" class="primary small">Queue for resume + cover letter</button>
-      <button id="m-done" class="small">Close &amp; view in list</button>
+      <button id="m-done" class="primary small">Close &amp; view in list</button>
     </div>`;
-  document.getElementById('m-queue').onclick = async () => {
-    const btn = document.getElementById('m-queue');
-    const jid = res.job_id;
-    btn.disabled = true; btn.textContent = 'Starting…';
-    try {
-      // This used to stop at /api/jobs/queue (which only flips the status flag)
-      // and call it done, showing "Queued ✓" with no follow-through -- nothing
-      // ever actually generated until you separately opened the job and hit
-      // "Retry generating" there. Mirrors jd-queue's real behavior now: queue,
-      // then actually kick off generate-queued and poll it to a real result.
-      await post('/api/jobs/queue', {job_id: jid});
-      const qres = await post('/api/jobs/generate-queued', {});
-      if (qres.error || !qres.candidates) { btn.textContent = 'Queued ✓'; loadJobs(); return; }
-      while (true) {
-        await new Promise(r => setTimeout(r, 1500));
-        const st = await api('/api/jobs/generate-queued/status');
-        if (!st.running) {
-          const mine = (st.failed || []).find(f => f.job_id === jid);
-          if (mine) {
-            btn.disabled = false; btn.textContent = 'Retry generating';
-            document.getElementById('m-result').insertAdjacentHTML('beforeend',
-              `<p style="color:var(--bad)">Generation failed: ${esc(mine.reason || 'unknown error -- see server logs')}</p>`);
-          } else {
-            btn.textContent = 'Generated ✓';
-          }
-          loadJobs();
-          if (document.getElementById('view-applications').hidden === false) loadApplications();
-          return;
-        }
-        btn.textContent = `Generating… ${st.done}/${st.total}`;
-      }
-    } catch (e) {
-      // Same silent-death bug as jd-queue -- any non-2xx response here threw
-      // uncaught and the button just froze with no visible error at all.
-      btn.disabled = false; btn.textContent = 'Retry generating';
-      document.getElementById('m-result').insertAdjacentHTML('beforeend',
-        `<p style="color:var(--bad)">${esc(e.message)}</p>`);
-    }
-  };
   document.getElementById('m-done').onclick = () => { closeManual(); loadJobs(); };
   loadJobs();
-  if (document.getElementById('view-applications').hidden === false) loadApplications();
 }
 
 // ── applications view ────────────────────────────────────────────────
@@ -525,57 +364,30 @@ async function loadApplications() {
   for (const a of data.applications) {
     const div = document.createElement('div');
     div.className = 'app-row';
-    const hist = (a.status_history || []).map(ev =>
+    const hist = a.events.map(ev =>
       `<div>${new Date(ev.ts * 1000).toLocaleString()} — <b>${esc(ev.status)}</b> ${esc(ev.note || '')}</div>`).join('');
-    // Quick-marked ("applied elsewhere, never generated through this tool")
-    // rows have an empty folder_path and {} ats_estimate -- no docs to link,
-    // no ATS score to show, so that whole block is skipped for those.
     div.innerHTML = `
       <div class="app-head">
         <div>
           <div class="job-title">${esc(a.title)}</div>
-          <div class="job-company">${esc(a.company)}${a.folder_path ? ' · ATS ' + a.ats_estimate.score + (a.ats_estimate.rendered_pages ? ` (${a.ats_estimate.rendered_pages}p)` : '') : ' · applied directly, no materials generated here'} · status: <b>${esc(a.status)}</b></div>
+          <div class="job-company">${esc(a.company)}${a.score != null ? ' · fit ' + Math.round(a.score) : ''} · status: <b>${esc(a.status)}</b></div>
         </div>
-        <span class="badge badge-${a.status === 'generated' ? 'new' : 'generated'}">${esc(a.status)}</span>
+        <span class="badge badge-done">${esc(a.status)}</span>
       </div>
-      ${a.folder_path ? `
+      ${a.has_files ? `
       <div class="doc-links" style="margin-top:8px">
-        <a class="doc-link" href="${appDocUrl(a.folder_path, 'resume.pdf')}">Resume <span class="ext">PDF</span></a>
-        <a class="doc-link alt" href="${appDocUrl(a.folder_path, 'resume.docx')}">.docx</a>
-        <a class="doc-link" href="${appDocUrl(a.folder_path, 'cover_letter.pdf')}">Cover letter <span class="ext">PDF</span></a>
-        <a class="doc-link alt" href="${appDocUrl(a.folder_path, 'cover_letter.docx')}">.docx</a>
-        <a class="doc-link alt" href="${appDocUrl(a.folder_path, 'job_description.md')}">Job description</a>
+        <a class="doc-link" href="${docUrl(a.job_id, 'resume')}">Resume <span class="ext">PDF</span></a>
+        <a class="doc-link alt" href="${docUrl(a.job_id, 'resume_docx')}">.docx</a>
+        <a class="doc-link" href="${docUrl(a.job_id, 'cover')}">Cover letter <span class="ext">PDF</span></a>
+        <a class="doc-link alt" href="${docUrl(a.job_id, 'cover_docx')}">.docx</a>
+        <a class="doc-link alt" href="${docUrl(a.job_id, 'jd')}">Job description</a>
       </div>` : ''}
-      ${a.status === 'generated' ? `
-      <div class="referral-form">
-        <select class="via-select">
-          <option value="company_site">company site</option>
-          <option value="linkedin">LinkedIn</option>
-          <option value="referral">referral</option>
-          <option value="recruiter">recruiter</option>
-          <option value="other">other</option>
-        </select>
-        <input class="referral-name" type="text" placeholder="referral name (optional)">
-        <input class="referral-note" type="text" placeholder="referral note (optional)">
-        <button class="primary small mark-applied">Mark applied</button>
-      </div>` : `
       <div class="status-track">
         ${STATUS_FLOW.map(s => `<button class="add-status" data-status="${s}">${s.replace('_',' ')}</button>`).join('')}
         <span class="dim" style="align-self:center;font-size:12px">via ${esc(a.applied_via || '?')}${a.referral_name ? ' · referral: ' + esc(a.referral_name) : ''}</span>
-      </div>`}
+      </div>
       <div class="status-hist">${hist}</div>
     `;
-    const markBtn = div.querySelector('.mark-applied');
-    if (markBtn) markBtn.onclick = async () => {
-      await post('/api/applications/mark-applied', {
-        app_id: a.id,
-        via: div.querySelector('.via-select').value,
-        referral_name: div.querySelector('.referral-name').value.trim(),
-        referral_note: div.querySelector('.referral-note').value.trim(),
-      });
-      loadApplications();
-      loadJobs();
-    };
     div.querySelectorAll('.add-status').forEach(btn => {
       btn.onclick = async () => {
         const note = prompt(`Note for "${btn.dataset.status}" (optional):`) || '';
@@ -589,15 +401,12 @@ async function loadApplications() {
 
 // ── gaps view ────────────────────────────────────────────────────────
 // Distinct real gaps across every scored posting, clustered by meaning
-// (one LLM call, run on demand -- see _cluster_missing_gaps server-side),
-// most-common first. Each cluster carries the real source job_ids it was
-// built from, so "rejudge" targets exactly those postings against
-// whatever the master doc looks like right now -- not a blanket re-score.
+// (one LLM call, run on demand), most-common first.
 async function loadGaps(force) {
   const list = document.getElementById('gaps-list');
   const count = document.getElementById('gaps-count');
   // Plain tab-open reads the cached result (near-instant, no LLM call) --
-  // only an explicit refresh (the button, or a rejudge just finishing)
+  // only an explicit refresh (the button)
   // recomputes. Used to re-cluster with a real call every single time
   // this tab was opened, which is the actual reason it looked slow. A
   // plain open still shows SOME placeholder, not nothing -- the very
@@ -622,7 +431,7 @@ async function loadGaps(force) {
   const computedNote = data.computed_ts ? ` · computed ${new Date(data.computed_ts * 1000).toLocaleString()}` : '';
   count.textContent = `${data.scored_count} posting(s) scored${computedNote}`;
   if (!data.clusters.length) {
-    list.innerHTML = '<p class="dim">No gaps to show -- score some postings first (AI-judge on the Postings tab), or none of your scored postings have a real gap flagged.</p>';
+    list.innerHTML = '<p class="dim">No gaps to show yet -- they appear as resumes are generated.</p>';
     return;
   }
   list.innerHTML = '';
@@ -631,24 +440,7 @@ async function loadGaps(force) {
     row.className = 'gap-row';
     row.innerHTML = `
       <div class="gap-count">${c.count}</div>
-      <div class="gap-label">${esc(c.label)}</div>
-      <button class="small gap-rejudge">Rejudge these ${c.count}</button>`;
-    row.querySelector('.gap-rejudge').onclick = async () => {
-      const btn = row.querySelector('.gap-rejudge');
-      btn.disabled = true; btn.textContent = 'Rejudging…';
-      const res = await post('/api/jobs/rejudge-cluster', {job_ids: c.job_ids});
-      if (res.error) { flashCount(res.error); btn.disabled = false; btn.textContent = `Rejudge these ${c.count}`; return; }
-      while (true) {
-        await new Promise(r => setTimeout(r, 1500));
-        const st = await api('/api/jobs/llm-backfill/status');
-        if (!st.running) {
-          flashCount(`Rejudged ${st.judged} of ${st.total} affected posting(s).`);
-          loadGaps(true);   // force: re-cluster from the fresh scores, not the stale cache
-          return;
-        }
-        btn.textContent = `Rejudging… ${st.done}/${st.total}`;
-      }
-    };
+      <div class="gap-label">${esc(c.label)}</div>`;
     list.appendChild(row);
   }
 }
@@ -702,42 +494,17 @@ function reloadCurrentView() {
   if (showingCompanyCards) loadCompanies(); else loadJobs();
 }
 
-// Fetch only -- no LLM call here, ever. AI judging is the separate button
-// below, triggered explicitly. Runs async server-side (a real fetch across
-// the whole company list takes well over a minute of real HTTP calls to
-// each board, too long to hold the request open for) -- start it, then
-// poll /api/jobs/refetch/status the same way AI-judge polling works, so a
-// reload (or just waiting) shows the real result once it lands, not a
-// browser tab hung on an open connection with no feedback.
-// "0 new postings" and "every source failed" used to read identically in
-// the UI -- fetch_ats.py already prints the real breakdown (new / already-
-// tracked / outside India / too old / errored) to its own stdout, captured
-// in st.log, just never shown. Pulling the real "total: ..." line out of it
-// so a genuinely empty cycle doesn't read as "is this broken?" anymore.
-function _fetchSummary(st) {
-  const re = /total: (\d+) new job rows added, (\d+) already-tracked duplicates skipped, (\d+) skipped \(outside India[^)]*\), (\d+) skipped \(older than[^)]*\), (\d+) sources errored/;
-  const m = (st.log || '').match(re);
-  if (!m) return {short: st.ok ? `${st.new_postings} new posting(s) fetched.` : 'Fetch failed -- check server logs.', full: st.log || '', add: st.new_postings || 0, bits: []};
-  const [, add, dup, loc, age, err] = m;
-  const bits = [`${dup} already tracked`, `${loc} outside India`, `${age} too old`];
-  if (+err) bits.push(`${err} source(s) errored`);
-  return {short: `${add} new (${bits.join(', ')}).`, full: st.log || '', add: +add, bits};
-}
-// Dialog version of the same result flashCount() already shows as a tooltip --
-// the number matters enough on a fetch (potentially minutes of waiting) to
-// surface prominently instead of only in a hover title that's easy to miss.
-function openFetchResult(st, summary) {
-  const bitsHtml = summary.bits.length
-    ? `<div class="kw-list">${summary.bits.map(b => `<span class="kw kw-weak">${esc(b)}</span>`).join('')}</div>`
-    : `<div style="font-size:14px">${esc(summary.short)}</div>`;
-  const todayLine = st.added_today != null
-    ? `<div class="dim" style="font-size:12.5px;margin-top:8px">${st.added_today} added today in total</div>` : '';
+// Fetch only. Runs in the background (a real fetch across every board takes a
+// minute or more), so start it, then poll the worker's status until it ends.
+function openFetchResult(f) {
+  const bits = [];
+  if (f.errors) bits.push(`${f.errors} source(s) errored`);
   document.getElementById('fr-body').innerHTML = `
-    <div class="score-block" style="border:1px solid ${st.ok === false ? 'var(--bad)' : 'var(--accent)'}">
-      <div><div class="num">${summary.add}</div><div class="dim" style="font-size:13px">new just now</div></div>
+    <div class="score-block" style="border:1px solid ${f.ok === false ? 'var(--bad)' : 'var(--accent)'}">
+      <div><div class="num">${f.new}</div><div class="dim" style="font-size:13px">new just now</div></div>
       <div style="flex:1">
-        ${st.ok === false ? `<div style="font-size:14px;color:var(--bad)">${esc(summary.short)}</div>` : bitsHtml}
-        ${todayLine}
+        ${f.ok === false ? `<div style="font-size:14px;color:var(--bad)">Fetch failed: ${esc(f.error)}</div>`
+          : `<div style="font-size:14px">${f.seen} postings seen, ${f.rows_created} queued for generation${bits.length ? ' · ' + esc(bits.join(', ')) : ''}.</div>`}
       </div>
     </div>`;
   document.getElementById('overlay').hidden = false;
@@ -751,12 +518,11 @@ function closeFetchResult() {
 async function pollFetchStatus(btn) {
   while (true) {
     await new Promise(r => setTimeout(r, 1500));
-    const st = await api('/api/jobs/refetch/status');
-    if (!st.running) {
+    const f = (await api('/api/jobs/fetch-status')).fetch;
+    if (!f.running) {
       btn.disabled = false; btn.textContent = 'Fetch new';
-      const summary = _fetchSummary(st);
-      flashCount(summary.short, summary.full);
-      openFetchResult(st, summary);
+      flashCount(f.ok === false ? 'Fetch failed -- check server logs.' : `${f.new} new posting(s) fetched.`);
+      openFetchResult(f);
       reloadCurrentView();
       return;
     }
@@ -766,119 +532,21 @@ async function pollFetchStatus(btn) {
 document.getElementById('btn-refetch').onclick = async () => {
   const btn = document.getElementById('btn-refetch');
   btn.disabled = true; btn.textContent = 'Fetching…';
-  const res = await post('/api/jobs/refetch');
-  if (res.error) { flashCount(res.error); btn.disabled = false; btn.textContent = 'Fetch new'; return; }
+  try {
+    await post('/api/jobs/refetch');
+  } catch (e) { flashCount(e.message); btn.disabled = false; btn.textContent = 'Fetch new'; return; }
   pollFetchStatus(btn);
 };
-// The only place a pre-generation AI judgment happens -- judges target-
-// title India/Bangalore postings that are new, or stale (point bank
-// changed since they were last judged). Can take a while for a large
-// batch; button stays disabled so it's clear something's happening.
-// AI-judge runs async server-side (a real "all of them" batch is too many
-// LLM calls to hold one HTTP request open for) -- start it, then poll
-// /api/jobs/llm-backfill/status for real progress (each score lands in the
-// db the moment that one call finishes, so "done"/"total" are real counts,
-// not a guess) until the background batch reports done.
-// Persistent, survives a refresh -- unlike flashCount's 4s fade, this is
-// the durable record of "is something running right now, and what did the
-// last run actually do", read from the server's real _judge_progress
-// state, not from anything stored in this one browser tab. A refresh used
-// to lose all of this: the button just reset to "AI-judge" whether a batch
-// was still running in the background or had finished minutes ago, with
-// zero way to tell which.
-function renderJudgeTracker(st) {
-  const el = document.getElementById('judge-tracker');
-  if (!st || st.started_ts == null) { el.textContent = ''; el.title = ''; return; }
-  if (st.running) {
-    el.textContent = `AI-judging… ${st.done}/${st.total} (${st.judged} judged so far)`;
-    el.title = '';
-    return;
-  }
-  const failed = st.failed || [];
-  const prefix = st.interrupted ? `Interrupted by a restart at ${st.done}/${st.total}` : `Last AI-judge: ${st.judged} of ${st.total} judged`;
-  el.textContent = failed.length ? `${prefix}, ${failed.length} failed` : prefix;
-  el.title = failed.length ? failed.map(f => `${f.company} -- ${f.title}: ${f.reason}`).join('\n') : '';
+// Queue depth, so "pending" has an answer to "how long?".
+async function refreshQueue() {
+  try {
+    const st = await api('/api/jobs/fetch-status');
+    document.getElementById('queue-tracker').textContent =
+      st.current || st.queued ? `generating… ${st.queued} more queued` : '';
+  } catch (e) { /* the tracker is a nicety, never an error */ }
 }
-// btn is optional -- null when this poll loop was started on page load
-// (an already-running batch picked up after a refresh), not from a click
-// in this tab. Either way the tracker updates every tick; the button only
-// updates when one's actually in play.
-async function pollJudgeStatus(btn, defaultLabel) {
-  while (true) {
-    await new Promise(r => setTimeout(r, 1500));
-    const st = await api('/api/jobs/llm-backfill/status');
-    renderJudgeTracker(st);
-    if (!st.running) {
-      if (btn) { btn.disabled = false; btn.textContent = defaultLabel; }
-      const failed = st.failed || [];
-      // "judged X of Y" alone looked identical whether everything else
-      // was skipped (already judged, nothing new) or every single call
-      // actually failed -- same gap the fetch-button dialog fixed earlier,
-      // same fix: surface the real reasons, not just the count.
-      const short = failed.length
-        ? `AI-judged ${st.judged} of ${st.total} -- ${failed.length} failed.`
-        : `AI-judged ${st.judged} of ${st.total} posting(s).`;
-      const full = failed.length
-        ? failed.map(f => `${f.company} -- ${f.title}: ${f.reason}`).join('\n')
-        : '';
-      flashCount(short, full);
-      reloadCurrentView();
-      return;
-    }
-    if (btn) btn.textContent = `AI-judging… ${st.done}/${st.total}`;
-  }
-}
-// On load -- not just on click -- so a refresh mid-batch resumes live
-// tracking instead of silently losing it, and a refresh after a batch
-// finished still shows what it actually did, not a blank slate.
-(async () => {
-  const st = await api('/api/jobs/llm-backfill/status');
-  renderJudgeTracker(st);
-  if (st.running) {
-    const btn = document.getElementById('btn-llm-backfill');
-    btn.disabled = true; btn.textContent = `AI-judging… ${st.done}/${st.total}`;
-    pollJudgeStatus(btn, 'AI-judge');
-  }
-})();
-document.getElementById('btn-llm-backfill').onclick = async () => {
-  const btn = document.getElementById('btn-llm-backfill');
-  btn.disabled = true; btn.textContent = 'Starting…';
-  // Its own date box (f-judge-days), separate from the list's display
-  // filter (f-date) -- the two used to share one input, which meant
-  // narrowing the list to browse also silently narrowed what AI-judge would
-  // score. Never changes the server's own "not yet judged, or stale"
-  // default -- the date cutoff is an extra AND on top of that, not a
-  // replacement for it.
-  const days = document.getElementById('f-judge-days').value;
-  const res = await post('/api/jobs/llm-backfill', {days});
-  if (res.error) { flashCount(res.error); btn.disabled = false; btn.textContent = 'AI-judge'; return; }
-  if (!res.candidates) { flashCount('Nothing new or stale to judge.'); btn.disabled = false; btn.textContent = 'AI-judge'; return; }
-  pollJudgeStatus(btn, 'AI-judge');
-};
-// Clear only -- it used to also force an immediate re-judge pass in the
-// same click (and called itself "...all", even though it was already
-// scoped to a date filter, which was the actually-confusing part). Simpler
-// now: this button only wipes scores, in its own date window (f-clear-days,
-// independent of the list filter and of AI-judge's own day count). A
-// cleared posting has no score, which already satisfies AI-judge's normal
-// "not yet judged" default -- so re-judging it is just clicking AI-judge
-// next, same as for any other unjudged posting, not a special combined flow.
-document.getElementById('btn-clear-llm').onclick = async () => {
-  document.getElementById('more-actions').open = false;
-  const days = document.getElementById('f-clear-days').value;
-  const scopeLabel = days ? `the last ${days} day(s)` : 'ALL TIME';
-  if (!confirm(`Clear AI scores for postings fetched in ${scopeLabel}? `
-    + '(change the day count above first to widen or narrow this) '
-    + "You'll need to click AI-judge afterward to re-score them -- real LLM cost per posting.")) return;
-  const btn = document.getElementById('btn-clear-llm');
-  btn.disabled = true;
-  btn.textContent = 'Clearing…';
-  const cleared = await post('/api/jobs/clear-llm-scores', {days});
-  btn.disabled = false;
-  btn.textContent = 'Clear scores';
-  flashCount(`Cleared ${cleared.cleared}.`);
-  reloadCurrentView();
-};
+refreshQueue();
+setInterval(refreshQueue, 5000);
 function resetAndLoad() {
   currentPage = 1;
   reloadCurrentView();
@@ -1376,13 +1044,6 @@ function closeMasterDoc() {
 }
 document.getElementById('btn-masterdoc').onclick = openMasterDoc;
 
-// The "More" menu is a native <details>, which only closes on its own
-// summary click -- clicking anywhere else on the page left it hanging open.
-document.addEventListener('click', (e) => {
-  const more = document.getElementById('more-actions');
-  if (more.open && !more.contains(e.target)) more.open = false;
-});
-
 // ── Telegram notifications: one bot/chat per user ───────────────────────
 async function loadTelegramConfig() {
   const status = document.getElementById('pf-telegram-status');
@@ -1442,7 +1103,7 @@ document.getElementById('pf-tg-test').onclick = async () => {
 // this independently either way (every mutating route checks role itself),
 // this is just so the UI doesn't invite a guest to try.
 const GUEST_DISABLED_BUTTON_IDS = [
-  'btn-manual', 'btn-refetch', 'btn-llm-backfill', 'btn-clear-llm',
+  'btn-manual', 'btn-refetch',
   'pf-upload-btn', 'pf-paste-btn', 'pf-tg-save', 'pf-tg-test',
 ];
 
