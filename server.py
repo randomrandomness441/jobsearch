@@ -5,13 +5,11 @@ elsewhere -- worker.py (queue + fetch), pipeline.py (one job), db.py.
     ./server.py        then open http://localhost:8777
 """
 
-import base64
 import json
 import os
 import secrets
 import sqlite3
 import sys
-import tempfile
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,10 +19,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ats
 import auth
 import db
+import gaps
 import links
+import master
 import notify_telegram
 import pipeline
-import profile_ai
 import worker
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -242,14 +241,14 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/applications/list":
             return self._json({"applications": db.application_all(uid)})
         if p == "/api/profile/points":
-            points = db.point_bank_all(uid, active_only=qs.get("all", ["0"])[0] != "1")
+            points = master.point_bank_all(uid, active_only=qs.get("all", ["0"])[0] != "1")
             for pt in points:      # a bracketed draft isn't real resume content yet, nothing to grade
                 pt["quality"] = None if pt["text"].lstrip().startswith("[") else ats.check_bullet_brag(pt["text"])
             return self._json({"points": points})
         if p == "/api/profile/skills":
-            return self._json({"skills": db.skills_all(uid)})
+            return self._json({"skills": master.skills_all(uid)})
         if p == "/api/profile/fields":
-            return self._json({"profile": db.profile_all(uid)})
+            return self._json({"profile": master.profile_all(uid)})
         if p == "/api/admin/users":
             if user["role"] != "admin":
                 return self._json({"error": "admin only"}, 403)
@@ -265,7 +264,7 @@ class Handler(BaseHTTPRequestHandler):
         """Cached: a tab-open reads the stored clusters; only Refresh pays for the LLM call."""
         cached = db.gap_clusters_get(uid)
         if cached is None or refresh:
-            clusters = profile_ai.cluster_gaps(db.analysis_gaps(uid))
+            clusters = gaps.cluster_gaps(db.analysis_gaps(uid))
             db.gap_clusters_set(uid, clusters)
             cached = db.gap_clusters_get(uid) or {"clusters": [], "computed_ts": time.time()}
         return {**cached, "scored_count": db.analysis_done_count(uid)}
@@ -370,134 +369,45 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def _profile_post(self, p, b, uid):
-        if p == "/api/profile/points/rewrite-check":
-            text = (b.get("text") or "").strip()
-            if not text:
-                return self._json({"status": "error", "message": "no text given"})
-            result = profile_ai.rewrite_point(text, b.get("company", ""), b.get("role", ""))
-            if result is None:
-                return self._json({"status": "error", "message": "The LLM call failed -- couldn't check this bullet "
-                                                                   "right now. You can retry, or save as written."})
-            return self._json(result)
+        """The master document is edited by the user and nobody else: every
+        route here is a plain write to the user's JSON file, no LLM."""
+        try:
+            return self._master_edit(p, b, uid)
+        except ValueError as e:                 # master.py's own message says what is wrong
+            raise BadRequest(str(e))
 
-        if p == "/api/profile/points/tidy":
-            real = [pt for pt in db.point_bank_all(uid) if not pt["text"].lstrip().startswith("[")]
-            by_company = {}
-            for pt in real:
-                by_company.setdefault(pt["company"], pt["role"])
-            results = []
-            for company, role in by_company.items():
-                existing = [pt["text"] for pt in real if pt["company"] == company]
-                result = profile_ai.tidy_company(company, role, existing)
-                if result is None:
-                    continue         # couldn't check this company; leave it as it is
-                if sorted(result["points"]) != sorted(existing):
-                    results.append({"company": company, "role": role, "current_texts": existing,
-                                    "proposed_texts": result["points"], "notes": result["notes"]})
-            return self._json({"companies": results, "checked_points": len(real)})
+    def _master_edit(self, p, b, uid):
+        if p == "/api/profile/points/add":
+            tags = b.get("tags") or []
+            if isinstance(tags, str):
+                tags = [t.strip() for t in tags.split(",") if t.strip()]
+            if b.get("entry_type", "role") not in master.ENTRY_TYPES:
+                raise BadRequest(f"entry_type must be one of {master.ENTRY_TYPES}")
+            for key in ("company", "role", "text"):
+                if not (b.get(key) or "").strip():
+                    raise BadRequest(f"{key} is required")
+            pid = master.point_bank_add(uid, b["company"], b["role"], b.get("start_date", ""), b.get("end_date"),
+                                        b["text"], tags=tags, entry_type=b.get("entry_type", "role"))
+            return self._json({"ok": True, "id": pid})
 
         if p == "/api/profile/points/update":
             text = b.get("text", "")
+            master.point_bank_update_text(uid, _int(b.get("id")), text)
             quality = ats.check_bullet_brag(text)
-            db.point_bank_update_text(uid, _int(b.get("id")), text)
             return self._json({"ok": True, "quality_warning": None if quality["ok"] else quality})
 
         if p == "/api/profile/points/toggle":
-            db.point_bank_set_active(uid, _int(b.get("id")), bool(b.get("active", True)))
+            master.point_bank_set_active(uid, _int(b.get("id")), bool(b.get("active", True)))
             return self._json({"ok": True})
 
-        if p == "/api/profile/points/tidy-commit":
-            return self._json({"companies_updated": self._tidy_commit(uid, b.get("companies", []))})
-
         if p == "/api/profile/skills/add":
-            db.skills_add(uid, b.get("name", ""), b.get("category", "Other"))
+            master.skills_add(uid, b.get("name", ""), b.get("category", "Other"))
             return self._json({"ok": True})
 
         if p == "/api/profile/fields/set":
-            db.profile_set(uid, b.get("key", ""), b.get("value", ""))
+            master.profile_set(uid, b.get("key", ""), b.get("value", ""))
             return self._json({"ok": True})
-
-        if p == "/api/profile/extract":
-            return self._extract(b, uid)
-
-        if p == "/api/profile/extract/commit":
-            added_points = skipped = added_skills = 0
-            for pt in b.get("points", []):
-                if db.point_bank_find_similar(uid, pt.get("text", ""))[0]:
-                    skipped += 1
-                    continue
-                tags = pt.get("tags") or []
-                if isinstance(tags, str):
-                    tags = [t.strip() for t in tags.split(",") if t.strip()]
-                db.point_bank_add(uid, pt.get("company", ""), pt.get("role", ""), pt.get("start_date", ""),
-                                  pt.get("end_date") or None, pt.get("text", ""), tags=tags)
-                added_points += 1
-            for s in b.get("skills", []):
-                db.skills_add(uid, s.get("name", ""), s.get("category", "Other"))
-                added_skills += 1
-            return self._json({"added_points": added_points, "skipped_dupes": skipped, "added_skills": added_skills})
         self.send_error(404)
-
-    def _tidy_commit(self, uid, companies):
-        """Apply accepted tidy results. A point whose text survives is left
-        alone; one whose text doesn't was folded into a merge and is retired
-        (never deleted); text that matches nothing on file is inserted."""
-        updated = 0
-        for entry in companies:
-            company, role = entry.get("company", ""), entry.get("role", "")
-            accepted = [str(t).strip() for t in entry.get("texts", []) if str(t).strip()]
-            existing = [pt for pt in db.point_bank_all(uid) if pt["company"] == company]
-            by_text = {}
-            for pt in existing:
-                by_text.setdefault(pt["text"], pt)
-            retired = [pt for text, pt in by_text.items() if text not in set(accepted)]
-            new_texts = [t for t in accepted if t not in by_text]
-            if not retired and not new_texts:
-                continue
-            starts = [r["start_date"] for r in retired if r["start_date"]]
-            ends = [r["end_date"] for r in retired]
-            tags = sorted({t for r in retired for t in r["tags"]})
-            entry_type = retired[0]["entry_type"] if retired else (existing[0]["entry_type"] if existing else "role")
-            end = None if (not ends or any(not e for e in ends)) else max(ends)
-            for text in new_texts:
-                db.point_bank_add(uid, company, role, min(starts) if starts else "", end, text, tags=tags,
-                                  entry_type=entry_type)
-            for pt in retired:
-                db.point_bank_set_active(uid, pt["id"], False)
-            updated += 1
-        return updated
-
-    def _extract(self, b, uid):
-        """Upload or pasted text -> proposed points. Never writes; the UI shows
-        an editable review list first."""
-        text = (b.get("text") or "").strip()
-        if not text:
-            ext = os.path.splitext(b.get("filename", "upload"))[1].lower()
-            if ext not in (".pdf", ".docx", ".txt", ".md"):
-                raise BadRequest(f"unsupported file type {ext or '(none)'} -- use .pdf, .docx, .txt or .md")
-            try:
-                raw = base64.b64decode(b.get("content_base64", ""))
-            except Exception:
-                raise BadRequest("bad file upload")
-            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
-                f.write(raw)
-                tmp = f.name
-            try:
-                text = profile_ai.extract_file_text(tmp, ext)
-            finally:
-                os.unlink(tmp)
-        if not text.strip():
-            raise BadRequest("no text found -- paste some text or choose a different file")
-        existing = db.point_bank_all(uid, active_only=False)
-        proposal, err = profile_ai.extract_profile(text, sorted({pt["company"] for pt in existing}),
-                                                   "\n".join(f"- [{pt['company']}] {pt['text']}" for pt in existing))
-        if err:
-            return self._json({"error": err}, 500)
-        for pt in proposal.get("points", []):      # marks near-duplicates, doesn't drop them
-            match, _ = db.point_bank_find_similar(uid, pt.get("text", ""))
-            pt["likely_duplicate"] = match is not None
-            pt["duplicate_of_text"] = match["text"] if match else None
-        return self._json({"proposal": proposal})
 
     def _admin(self, p, b):
         if p == "/api/admin/users/add":
@@ -506,7 +416,11 @@ class Handler(BaseHTTPRequestHandler):
                 raise BadRequest("a real email address is required")
             db.users_add(email)
         elif p == "/api/admin/users/remove":
-            db.users_remove((b.get("email") or "").strip().lower())
+            email = (b.get("email") or "").strip().lower()
+            user = db.users_get(email)
+            db.users_remove(email)
+            if user and user["role"] != "admin":     # admins can't be removed, so keep their document
+                master.delete(user["id"])
         else:
             return self.send_error(404)
         self._json({"users": [{k: u[k] for k in ("email", "role", "added_ts")} for u in db.users_all()]})

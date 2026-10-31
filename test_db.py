@@ -17,7 +17,7 @@ def mkjob(ext, company="Acme", title="Senior Software Engineer", loc="Bengaluru,
 
 class DbTest(unittest.TestCase):
     def setUp(self):
-        for t in ("analysis", "jobs", "point_bank", "skills", "gap_cluster", "users"):
+        for t in ("analysis", "jobs", "gap_cluster", "users"):
             db._run(f"DELETE FROM {t}" + (" WHERE role != 'admin'" if t == "users" else ""))
         self.admin = db.users_get("admin@x.com")["id"]
         self.bob = db.users_add("Bob@X.com")["id"]
@@ -101,19 +101,11 @@ class DbTest(unittest.TestCase):
             self._complete(self.admin, jid)
         self.assertEqual(db.analysis_get(self.admin, jid)["requirements"], [])
         db.analysis_claim(self.admin, jid)
-        pid = db.point_bank_add(self.admin, "Acme", "SWE", "2020", None, "did a thing", tags=["go"])
+        pid = 7                                                # a point id in the user's master document
         self._complete(self.admin, jid, pid)
         a = db.analysis_get(self.admin, jid)
         self.assertEqual((a["status"], a["score"], len(a["requirements"]), len(a["gaps"])), ("done", 77, 1, 1))
         self.assertEqual(a["requirements"][0]["evidence_point_id"], pid)
-
-    def test_foreign_evidence_id_is_nulled_not_trusted(self):
-        jid, _ = mkjob("1")
-        db.analysis_ensure(self.admin, jid)
-        db.analysis_claim(self.admin, jid)
-        bobs = db.point_bank_add(self.bob, "Acme", "SWE", "2020", None, "bob's work")
-        self._complete(self.admin, jid, bobs)
-        self.assertIsNone(db.analysis_get(self.admin, jid)["requirements"][0]["evidence_point_id"])
 
     def test_failed_complete_rolls_back_children(self):
         jid, _ = mkjob("1")
@@ -196,18 +188,6 @@ class DbTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             db.application_add_event(self.bob, a1, "offer")    # someone else's application
 
-    def test_point_bank_tags_and_skills(self):
-        pid = db.point_bank_add(self.admin, "Acme", "SWE", "2020", None, "x", tags=["Go", "go", "sql"])
-        self.assertEqual(db.point_bank_all(self.admin)[0]["tags"], ["Go", "sql"])
-        db.point_bank_set_active(self.bob, pid, False)         # not bob's row
-        self.assertEqual(len(db.point_bank_all(self.admin)), 1)
-        db.point_bank_set_active(self.admin, pid, False)
-        self.assertEqual(db.point_bank_all(self.admin), [])
-        self.assertEqual(len(db.point_bank_all(self.admin, active_only=False)), 1)
-        db.skills_add(self.admin, "Embeddings", "ML")
-        db.skills_add(self.admin, "embeddings", "AI")
-        self.assertEqual([(s["name"], s["category"]) for s in db.skills_all(self.admin)], [("Embeddings", "AI")])
-
     def test_gap_clusters_roundtrip(self):
         j1, _ = mkjob("1")
         j2, _ = mkjob("2")
@@ -221,10 +201,15 @@ class DbTest(unittest.TestCase):
     def test_removing_user_cascades(self):
         jid, _ = mkjob("1")
         db.analysis_ensure(self.bob, jid)
-        db.skills_add(self.bob, "Go", "Lang")
         db.users_remove("bob@x.com")
         self.assertEqual(db._all("SELECT * FROM analysis WHERE user_id = ?", self.bob), [])
-        self.assertEqual(db._all("SELECT * FROM skills WHERE user_id = ?", self.bob), [])
+
+    def test_user_ids_are_never_reused(self):
+        """A master document file is named by the user id, so a removed user's
+        id must never be handed to the next person added."""
+        newest = db.users_add("carol@x.com")["id"]
+        db.users_remove("carol@x.com")
+        self.assertGreater(db.users_add("dave@x.com")["id"], newest)
 
 
 if __name__ == "__main__":

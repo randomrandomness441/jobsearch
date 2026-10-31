@@ -11,6 +11,7 @@ os.environ["JOBSEARCH_DATA"] = _tmp
 os.environ["ALLOWED_LOGIN_EMAIL"] = "admin@x.com"
 
 import db  # noqa: E402
+import master  # noqa: E402
 import notify_telegram  # noqa: E402
 import pipeline  # noqa: E402
 import worker  # noqa: E402
@@ -25,9 +26,10 @@ def mkjob(ext, source="greenhouse", title="Senior Software Engineer", loc="Benga
 
 class WorkerTest(unittest.TestCase):
     def setUp(self):
-        for t in ("analysis", "jobs", "point_bank", "profile", "users"):
+        for t in ("analysis", "jobs", "users"):
             db._run(f"DELETE FROM {t}" + (" WHERE role != 'admin'" if t == "users" else ""))
         self.uid = db.users_get("admin@x.com")["id"]
+        master.delete(self.uid)
         while not worker._queue.empty():
             worker._queue.get()
         self.processed = []
@@ -113,8 +115,8 @@ class WorkerTest(unittest.TestCase):
     def test_ready_users_and_fetch_creates_rows_only_for_them(self):
         bob = db.users_add("bob@x.com")["id"]
         for k, v in PROFILE.items():
-            db.profile_set(self.uid, k, v)
-        db.point_bank_add(self.uid, "Acme", "SWE", "2020", None, "did a thing")
+            master.profile_set(self.uid, k, v)
+        master.point_bank_add(self.uid, "Acme", "SWE", "2020", None, "did a thing")
         self.assertEqual([u["id"] for u in worker.ready_users()], [self.uid])   # bob has no master doc
         import fetch_ats
         real = fetch_ats.main
@@ -128,6 +130,15 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(db._all("SELECT user_id FROM analysis"), [{"user_id": self.uid}])
         self.assertTrue(worker.fetch_state["ok"])
         self.assertIsNone(db._one("SELECT 1 AS x FROM analysis WHERE user_id = ?", bob))
+
+    def test_a_user_with_an_unreadable_master_document_is_simply_not_ready(self):
+        for k, v in PROFILE.items():
+            master.profile_set(self.uid, k, v)
+        master.point_bank_add(self.uid, "Acme", "SWE", "2020", None, "did a thing")
+        self.assertEqual([u["id"] for u in worker.ready_users()], [self.uid])
+        with open(master.path(self.uid), "w") as f:
+            f.write("not json")
+        self.assertEqual(worker.ready_users(), [])                          # no crash, no rows created for them
 
     def test_fetch_failure_is_reported_not_raised(self):
         import fetch_ats

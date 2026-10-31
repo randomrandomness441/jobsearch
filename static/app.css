@@ -174,14 +174,8 @@ label{display:block;font-size:14px;color:var(--fg-2);margin:10px 0 4px;font-weig
 .referral-form{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
 .referral-form input{flex:1;min-width:140px}
 
-/* ── profile view: minimal landing (upload + two buttons only) ──────── */
+/* ── profile view ─────────────────────────────────────────────────── */
 #pf-topbar{display:flex;gap:8px;justify-content:flex-end;margin-bottom:40px}
-#pf-upload-box{max-width:480px;margin:60px auto 0;text-align:center;
-  border:1px solid var(--border);border-radius:var(--radius);padding:32px 28px}
-#pf-upload-box h2{margin:0 0 6px;font-size:17.5px}
-#pf-upload-box p{margin:0 0 16px}
-#pf-upload-status{display:block;margin-top:10px}
-#pf-proposal-wrap{max-width:640px;margin:28px auto 0}
 #manage-panel h3{margin:0 0 8px}
 .pf-field-row{display:flex;align-items:center;gap:10px;padding:6px 0}
 .pf-field-row label{width:140px;flex-shrink:0;margin:0;font-size:14px;color:var(--fg-2)}
@@ -197,17 +191,6 @@ label{display:block;font-size:14px;color:var(--fg-2);margin:10px 0 4px;font-weig
 .pf-point-head .meta{font-size:13.5px;color:var(--fg-2)}
 .pf-point-row textarea{width:100%;font:14.5px var(--sans);min-height:44px}
 .pf-point-actions{display:flex;gap:8px;margin-top:6px}
-.rewrite-panel{border:1px solid var(--warn);background:var(--warn-bg);border-radius:var(--radius-sm);
-  padding:10px 12px;margin-top:8px}
-.rewrite-panel .rewrite-body{font-size:13.5px;line-height:1.5;white-space:pre-wrap}
-.rewrite-panel .rewrite-text{background:var(--panel);border-radius:5px;padding:8px 10px;margin:6px 0 0;
-  white-space:pre-wrap}
-.rewrite-panel .rewrite-actions{display:flex;gap:8px;margin-top:8px}
-.pf-proposal-row{border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 12px;margin-bottom:6px;
-  display:flex;gap:10px;align-items:flex-start}
-.pf-proposal-row textarea{flex:1;font:14px var(--sans);min-height:38px}
-#point-modal.panel{position:fixed;top:8vh;left:50%;right:auto;bottom:auto;transform:translateX(-50%);
-  width:min(560px,92vw);max-height:84vh;border-radius:var(--radius)}
 
 /* ── master document (read-only) ─────────────────────────────────── */
 #masterdoc-panel.panel{width:min(820px,95vw)}

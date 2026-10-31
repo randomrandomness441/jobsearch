@@ -108,26 +108,6 @@
       <button id="btn-manage">Manage entries</button>
     </div>
 
-    <div id="pf-upload-box">
-      <h2>Upload a resume</h2>
-      <p class="dim">.pdf, .docx, .txt or .md &mdash; parsed text shows below for you to review before anything is saved.</p>
-      <div class="row row-start">
-        <input id="pf-upload" type="file" accept=".pdf,.docx,.txt,.md">
-        <button id="pf-upload-btn" class="primary">Extract</button>
-      </div>
-      <button id="pf-paste-toggle" class="link-btn">or paste text instead &rarr;</button>
-      <div id="pf-paste-box" hidden>
-        <textarea id="pf-paste-text" rows="8" placeholder="Paste any text about your work &mdash; a bullet list, notes, an old resume draft, anything."></textarea>
-        <button id="pf-paste-btn" class="primary mt-sm">Extract</button>
-      </div>
-      <span id="pf-upload-status" class="dim"></span>
-    </div>
-
-    <div id="pf-proposal-wrap" hidden>
-      <h2 class="h2-sm">Parsed from your file &mdash; review, then add</h2>
-      <div id="pf-proposal"></div>
-    </div>
-
     <div id="pf-telegram-box" class="mt-sm">
       <h2 class="h2-sm">Telegram notifications</h2>
       <p class="dim" id="pf-telegram-status">Checking…</p>
@@ -175,20 +155,21 @@
       <input id="pf-show-retired" type="checkbox"> show retired
     </label>
     <div id="pf-points"></div>
-    <div class="row row-start">
-      <button id="pf-consolidate" title="Scans every company for points describing the same real accomplishment, worded differently -- proposes a cleaned-up list to review, never merges silently">Tidy master doc</button>
-    </div>
-  </div>
 
-  <!-- ── tidy review (Tidy master doc results) ─────────────────────── -->
-  <div id="tidy-panel" class="panel" hidden>
-    <button class="close-x" onclick="closeTidy()">✕</button>
-    <h2>Proposed cleanup</h2>
-    <p class="dim help-text">Each box below is one company's full point list after cleanup -- edit it directly if needed, uncheck a company to skip it, then commit.</p>
-    <div id="tidy-body"></div>
-    <div class="row mt-md">
-      <button id="tidy-commit" class="primary">Commit checked</button>
+    <h3 class="h3-manage h3-spaced">Add a point</h3>
+    <p class="dim help-text">Saved exactly as you type it. Nothing rewrites it.</p>
+    <div class="row row-start">
+      <select id="pf-np-type"><option value="role">work experience</option><option value="project">project</option></select>
+      <input id="pf-np-company" type="text" placeholder="company (or project name)" class="w-md">
+      <input id="pf-np-role" type="text" placeholder="role (or project tagline)" class="w-md">
     </div>
+    <div class="row row-start mt-sm">
+      <input id="pf-np-start" type="text" placeholder="start, e.g. 2024-04" class="w-md">
+      <input id="pf-np-end" type="text" placeholder="end (blank = present)" class="w-md">
+      <input id="pf-np-tags" type="text" placeholder="tags, comma separated" class="w-md">
+    </div>
+    <textarea id="pf-np-text" rows="3" placeholder="the accomplishment, as it should read on the resume" class="mt-sm"></textarea>
+    <div class="row row-start mt-sm"><button id="pf-add-point" class="primary">Add point</button></div>
   </div>
 
   <!-- ── master document (read-only, everything on file) ─────────────── -->

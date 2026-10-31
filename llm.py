@@ -29,7 +29,6 @@ import urllib.request
 
 ZAI_API_KEY = os.environ.get("ZAI_API_KEY", "")
 ZAI_MODEL = os.environ.get("ZAI_MODEL", "glm-5.3-flash")
-ZAI_MODEL_FULL = os.environ.get("ZAI_MODEL_FULL", "glm-5.3")
 # /coding/paas/v4/ is the endpoint the GLM Coding subscription covers; the
 # general /api/paas/v4/ bills a separate pay-as-you-go wallet.
 ZAI_URL = "https://api.z.ai/api/coding/paas/v4/chat/completions"
@@ -37,20 +36,17 @@ DEFAULT_TEMPERATURE = float(os.environ.get("DEFAULT_TEMPERATURE", "0.3"))
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL_FALLBACK = os.environ.get("ANTHROPIC_MODEL_FALLBACK", "claude-haiku-4-5-20251001")
-ANTHROPIC_MODEL_FULL = os.environ.get("ANTHROPIC_MODEL_FULL", "claude-sonnet-5")
 CLAUDE_CLI_OAUTH_TOKEN = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
 _CLAUDE_CLI_DISALLOWED_TOOLS = "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,NotebookEdit,Task"
 
-# Which model tier and reasoning effort each call site runs on. "low" effort
+# Reasoning effort for each call site. "low" effort
 # only: measured live, "high" took 239s against 23s for the same extraction
 # and 1,251s without finishing on the scoring prompt, with no quality gain.
 LLM_TUNING = {
-    "score":          {"model": "flash", "effort": "low"},
-    "select":         {"model": "flash", "effort": "low"},
-    "draft":          {"model": "flash", "effort": "low"},
-    "gap_cluster":    {"model": "flash", "effort": "low"},
-    "rewrite_point":  {"model": "full",  "effort": "low"},
-    "extract_profile": {"model": "full", "effort": "low"},
+    "score":          {"effort": "low"},
+    "select":         {"effort": "low"},
+    "draft":          {"effort": "low"},
+    "gap_cluster":    {"effort": "low"},
 }
 
 _local = threading.local()
@@ -245,12 +241,9 @@ def llm_json_call(system_prompt, messages, tuning, max_tokens=32000, temperature
     for ONLY a JSON object."""
     global _zai_cooldown_until
     cfg = LLM_TUNING[tuning]
-    full = cfg["model"] == "full"
-    zai_model = ZAI_MODEL_FULL if full else ZAI_MODEL
-    claude_model = ANTHROPIC_MODEL_FULL if full else ANTHROPIC_MODEL_FALLBACK
     has_fallback = bool(ANTHROPIC_API_KEY or CLAUDE_CLI_OAUTH_TOKEN)
     if not has_fallback or time.time() >= _zai_cooldown_until:
-        reply = _zai_call(system_prompt, messages, max_tokens, temperature, zai_model, cfg["effort"], deadline_s)
+        reply = _zai_call(system_prompt, messages, max_tokens, temperature, ZAI_MODEL, cfg["effort"], deadline_s)
         if reply is not None:
             _local.provider = "zai"
             return reply, "zai"
@@ -258,10 +251,10 @@ def llm_json_call(system_prompt, messages, tuning, max_tokens=32000, temperature
             return None, None
         _zai_cooldown_until = time.time() + _ZAI_COOLDOWN_SECONDS
         print(f"[llm] Zai failed -- falling back to Claude for {_ZAI_COOLDOWN_SECONDS}s", file=sys.stderr)
-    reply = _anthropic_call(system_prompt, messages, max_tokens, temperature, claude_model, deadline_s)
+    reply = _anthropic_call(system_prompt, messages, max_tokens, temperature, ANTHROPIC_MODEL_FALLBACK, deadline_s)
     provider = "claude-api"
     if reply is None:
-        reply = _claude_cli_call(system_prompt, messages, claude_model, deadline_s)
+        reply = _claude_cli_call(system_prompt, messages, ANTHROPIC_MODEL_FALLBACK, deadline_s)
         provider = "claude-cli"
     if reply is None:
         return None, None

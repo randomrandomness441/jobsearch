@@ -6,14 +6,14 @@ Two rules every function here follows:
       single conditional UPDATE, never a read-then-write);
     - anything touching more than one table runs inside tx(), so a reader
       never sees a half-written result (an analysis marked done without its
-      requirements, a point without its tags).
+      requirements).
 
-Everything private is keyed by user_id, never by email. `jobs` is the one
+Everything private is keyed by user_id, never by email. The user's master
+document is not here: it is a JSON file per user (master.py). `jobs` is the one
 shared table: public listings, one row per posting.
 """
 
 import contextlib
-import difflib
 import hashlib
 import os
 import re
@@ -132,79 +132,6 @@ def telegram_config_set(user_id, bot_token, chat_id):
          "ON CONFLICT(user_id) DO UPDATE SET bot_token=excluded.bot_token, "
          "chat_id=excluded.chat_id, updated_ts=excluded.updated_ts",
          user_id, bot_token, chat_id, time.time())
-
-
-# ── profile and skills ──────────────────────────────────────────────────
-def profile_all(user_id):
-    return {r["key"]: r["value"] for r in _all("SELECT key, value FROM profile WHERE user_id = ?", user_id)}
-
-
-def profile_set(user_id, key, value):
-    _run("INSERT INTO profile (user_id, key, value) VALUES (?,?,?) "
-         "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value", user_id, key, value)
-
-
-def skills_all(user_id, active_only=True):
-    q = "SELECT name, category, active FROM skills WHERE user_id = ?"
-    return _all(q + (" AND active = 1" if active_only else "") + " ORDER BY category, name", user_id)
-
-
-def skills_add(user_id, name, category):
-    """Name is case-insensitive in the schema, so a re-add with different
-    casing updates the one existing row and keeps its original spelling."""
-    _run("INSERT INTO skills (user_id, name, category) VALUES (?,?,?) "
-         "ON CONFLICT(user_id, name) DO UPDATE SET category=excluded.category, active=1",
-         user_id, name, category)
-
-
-# ── point bank ──────────────────────────────────────────────────────────
-def point_bank_add(user_id, company, role, start_date, end_date, text, tags=(), entry_type="role"):
-    with tx() as con:
-        pid = con.execute(
-            "INSERT INTO point_bank (user_id, entry_type, company, role, start_date, end_date, text) "
-            "VALUES (?,?,?,?,?,?,?)", (user_id, entry_type, company, role, start_date, end_date, text)).lastrowid
-        con.executemany("INSERT INTO point_tag (point_id, tag) VALUES (?,?) ON CONFLICT DO NOTHING",
-                        [(pid, t) for t in tags if t])
-    return pid
-
-
-def point_bank_all(user_id, active_only=True):
-    rows = _all(
-        "SELECT p.*, (SELECT group_concat(tag, char(31)) FROM point_tag t WHERE t.point_id = p.id) AS tag_list "
-        "FROM point_bank p WHERE p.user_id = ?" + (" AND p.active = 1" if active_only else "") +
-        " ORDER BY p.start_date DESC, p.id", user_id)
-    for r in rows:
-        tag_list = r.pop("tag_list")
-        r["tags"] = sorted(tag_list.split("\x1f")) if tag_list else []
-    return rows
-
-
-def point_bank_find_similar(user_id, text, threshold=0.82):
-    """Best near-duplicate already in this user's point bank, as (row, ratio),
-    or (None, 0.0). Catches a second resume variant re-extracting the same
-    accomplishment reworded slightly."""
-    norm = re.sub(r"\s+", " ", text.strip().lower())
-    best, best_ratio = None, 0.0
-    for row in point_bank_all(user_id, active_only=False):
-        ratio = difflib.SequenceMatcher(None, norm, re.sub(r"\s+", " ", row["text"].strip().lower())).ratio()
-        if ratio > best_ratio:
-            best, best_ratio = row, ratio
-    return (best, best_ratio) if best and best_ratio >= threshold else (None, 0.0)
-
-
-def point_bank_set_active(user_id, pid, active):
-    _run("UPDATE point_bank SET active = ? WHERE id = ? AND user_id = ?", 1 if active else 0, pid, user_id)
-
-
-def point_bank_update_text(user_id, pid, text):
-    _run("UPDATE point_bank SET text = ? WHERE id = ? AND user_id = ?", text, pid, user_id)
-
-
-def point_bank_update_entry_type(user_id, pid, entry_type, role=None):
-    """Reclassify between 'role' and 'project'; `role` optionally rewrites the
-    role/tagline column in the same statement."""
-    _run("UPDATE point_bank SET entry_type = ?, role = COALESCE(?, role) WHERE id = ? AND user_id = ?",
-         entry_type, role, pid, user_id)
 
 
 # ── jobs (shared) ───────────────────────────────────────────────────────
@@ -378,20 +305,18 @@ def analysis_complete(user_id, job_id, score, reason, provider, resume_path, cov
     with tx() as con:
         for t in ("analysis_requirement", "analysis_gap", "analysis_project", "analysis_item"):
             con.execute(f"DELETE FROM {t} WHERE user_id = ? AND job_id = ?", (user_id, job_id))
-        # evidence_point_id is only kept if it's a real row in THIS user's point bank
         con.executemany(
             "INSERT INTO analysis_requirement (user_id, job_id, pos, requirement, importance, presence, depth, "
-            "evidence_point_id, weight, earned) VALUES (?,?,?,?,?,?,?,"
-            "(SELECT id FROM point_bank WHERE id = ? AND user_id = ?),?,?)",
+            "evidence_point_id, weight, earned) VALUES (?,?,?,?,?,?,?,?,?,?)",
             [(user_id, job_id, i, r["requirement"], r["importance"], r["presence"], r["depth"],
-              r.get("evidence_point_id"), user_id, r["weight"], r["earned"]) for i, r in enumerate(requirements)])
+              r.get("evidence_point_id"), r["weight"], r["earned"]) for i, r in enumerate(requirements)])
         con.executemany("INSERT INTO analysis_gap (user_id, job_id, pos, gap, why, example) VALUES (?,?,?,?,?,?)",
                         [(user_id, job_id, i, g["gap"], g.get("why", ""), g.get("example", ""))
                          for i, g in enumerate(gaps)])
-        con.executemany("INSERT INTO analysis_project (user_id, job_id, point_id, worth_including, reason) "
-                        "VALUES (?,?,?,?,?)",
-                        [(user_id, job_id, p["point_id"], 1 if p["worth_including"] else 0, p.get("reason", ""))
-                         for p in projects])
+        con.executemany("INSERT INTO analysis_project (user_id, job_id, point_id, name, worth_including, reason) "
+                        "VALUES (?,?,?,?,?,?)",
+                        [(user_id, job_id, p["point_id"], p["name"], 1 if p["worth_including"] else 0,
+                          p.get("reason", "")) for p in projects])
         con.executemany("INSERT INTO analysis_item (user_id, job_id, pos, point_id, kind, text) VALUES (?,?,?,?,?,?)",
                         [(user_id, job_id, i, it["point_id"], it["kind"], it["text"]) for i, it in enumerate(items)])
         cur = con.execute(
@@ -472,8 +397,8 @@ def analysis_get(user_id, job_id):
     key = (user_id, job_id)
     a["requirements"] = _all("SELECT * FROM analysis_requirement WHERE user_id = ? AND job_id = ? ORDER BY pos", *key)
     a["gaps"] = _all("SELECT gap, why, example FROM analysis_gap WHERE user_id = ? AND job_id = ? ORDER BY pos", *key)
-    a["projects"] = _all("SELECT ap.point_id, p.company AS name, ap.worth_including, ap.reason FROM analysis_project ap "
-                         "JOIN point_bank p ON p.id = ap.point_id WHERE ap.user_id = ? AND ap.job_id = ?", *key)
+    a["projects"] = _all("SELECT point_id, name, worth_including, reason FROM analysis_project "
+                         "WHERE user_id = ? AND job_id = ?", *key)
     a["steps"] = _all("SELECT * FROM analysis_step WHERE user_id = ? AND job_id = ? ORDER BY attempt, started_ts", *key)
     return a
 

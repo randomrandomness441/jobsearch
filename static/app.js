@@ -462,12 +462,6 @@ function showView(name) {
   if (name === 'gaps') loadGaps();
   if (name === 'admin') loadAdminUsers();
   if (name === 'profile') {
-    // reset to a clean landing every time you switch in -- upload box +
-    // two buttons only, no stale proposal from a previous visit
-    document.getElementById('pf-proposal-wrap').hidden = true;
-    document.getElementById('pf-proposal').innerHTML = '';
-    document.getElementById('pf-upload-status').textContent = '';
-    document.getElementById('pf-upload').value = '';
     loadTelegramConfig();
   }
 }
@@ -600,71 +594,6 @@ function closeManage() {
 }
 document.getElementById('btn-manage').onclick = openManage;
 
-// ── Tidy master doc: one company's full point list, cleaned up ─────────
-// Same /api/profile/points/tidy endpoint the add-point flow uses below --
-// here called with no company (checks every company, returns only the
-// ones that actually changed).
-function closeTidy() {
-  document.getElementById('overlay').hidden = true;
-  document.getElementById('tidy-panel').hidden = true;
-}
-document.getElementById('pf-consolidate').onclick = async () => {
-  const btn = document.getElementById('pf-consolidate');
-  btn.disabled = true;
-  btn.textContent = 'Scanning…';
-  try {
-    const res = await post('/api/profile/points/tidy', {});
-    renderTidyAll(res);
-    document.getElementById('overlay').hidden = false;
-    document.getElementById('tidy-panel').hidden = false;
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Tidy master doc';
-  }
-};
-function renderTidyAll(res) {
-  const body = document.getElementById('tidy-body');
-  if (!res.companies.length) {
-    body.innerHTML = `<p class="dim">Checked ${res.checked_points} point(s) -- nothing needs combining right now.</p>`;
-    document.getElementById('tidy-commit').hidden = true;
-    return;
-  }
-  document.getElementById('tidy-commit').hidden = false;
-  body.innerHTML = `<p class="dim">Checked ${res.checked_points} point(s) across all companies, ${res.companies.length} found something to combine.</p>`;
-  res.companies.forEach((c) => {
-    const row = document.createElement('div');
-    row.className = 'pf-proposal-row';
-    row.dataset.company = c.company;
-    row.dataset.role = c.role;
-    row.innerHTML = `
-      <input type="checkbox" checked class="tidy-check">
-      <div style="flex:1">
-        <b>${esc(c.company)}</b>
-        <textarea class="tidy-text" rows="${Math.max(3, c.proposed_texts.length * 2)}">${esc(c.proposed_texts.join('\n\n'))}</textarea>
-        ${c.notes.length ? `<p class="dim" style="font-size:11.5px">${c.notes.map(esc).join(' -- ')}</p>` : ''}
-      </div>`;
-    body.appendChild(row);
-  });
-}
-document.getElementById('tidy-commit').onclick = async () => {
-  const btn = document.getElementById('tidy-commit');
-  btn.disabled = true;
-  try {
-    const companies = [];
-    document.querySelectorAll('#tidy-body .pf-proposal-row').forEach(row => {
-      if (!row.querySelector('.tidy-check').checked) return;
-      const texts = row.querySelector('.tidy-text').value.split('\n\n').map(t => t.trim()).filter(Boolean);
-      companies.push({company: row.dataset.company, role: row.dataset.role, texts});
-    });
-    const res = await post('/api/profile/points/tidy-commit', {companies});
-    flashCount(`Tidied ${res.companies_updated} company/companies.`);
-    loadProfile();
-    closeTidy();
-  } finally {
-    btn.disabled = false;
-  }
-};
-
 function renderFields(profile) {
   const el = document.getElementById('pf-fields');
   el.innerHTML = '';
@@ -695,43 +624,6 @@ function renderSkills(skills) {
       <div class="pf-cat-name">${esc(cat)}</div>
       ${byCat[cat].sort().map(n => `<span class="pf-skill-chip">${esc(n)}</span>`).join('')}
     </div>`).join('');
-}
-
-// Keyword+Use+Result rubric, LLM rewrite-or-refuse: runs BEFORE a point-bank
-// save, never invents a fact. Either proposes a rewrite (same facts, better
-// shape) or says exactly what's missing so he can recall the real fact --
-// shared by both the add-point modal and the Manage Entries edit flow below.
-async function runRewriteCheck(text, company, role) {
-  return await post('/api/profile/points/rewrite-check', {text, company, role});
-}
-
-function renderRewriteReview(panel, result, handlers) {
-  panel.hidden = false;
-  const body = panel.querySelector('.rewrite-body');
-  const actions = panel.querySelector('.rewrite-actions');
-  actions.innerHTML = '';
-  const addBtn = (label, fn, primary) => {
-    const btn = document.createElement('button');
-    btn.className = 'small' + (primary ? ' primary' : '');
-    btn.textContent = label;
-    btn.onclick = fn;
-    actions.appendChild(btn);
-  };
-  // Full response shown verbatim -- no trimming -- since the whole point of
-  // asking Zai is to tell him exactly what's missing or exactly what changed.
-  if (result.status === 'rewritten') {
-    body.innerHTML = `<b>Proposed rewrite</b> (same facts, reshaped -- nothing added):<p class="rewrite-text">${esc(result.text)}</p>`;
-    addBtn('Use this version', () => handlers.useRewritten(result.text), true);
-    addBtn('Keep my original text', handlers.keepOriginal);
-  } else if (result.status === 'missing_info') {
-    body.innerHTML = `<b>Missing:</b> ${esc(result.explanation)}<br><b>To recall it:</b> ${esc(result.question)}`;
-    addBtn('Save as written anyway', handlers.saveAnyway);
-    addBtn('Let me edit it', handlers.dismiss);
-  } else {
-    body.innerHTML = esc(result.message || 'Check failed.');
-    addBtn('Retry check', handlers.retry);
-    addBtn('Save as written anyway', handlers.saveAnyway);
-  }
 }
 
 function renderPoints(points) {
@@ -770,33 +662,19 @@ function _renderPointGroup(el, points) {
       <textarea>${esc(p.text)}</textarea>
       ${qualityNote}
       <div class="pf-point-actions">
-        <button class="small pf-save">Check &amp; save</button>
+        <button class="small pf-save">Save</button>
         <button class="small pf-toggle">${p.active ? 'Retire' : 'Restore'}</button>
       </div>
-      <div class="pf-rewrite-panel rewrite-panel" hidden>
-        <div class="rewrite-body"></div>
-        <div class="rewrite-actions"></div>
-      </div>`;
+      `;
     const textarea = row.querySelector('textarea');
-    const rewritePanel = row.querySelector('.pf-rewrite-panel');
-    async function finishSavePoint(text) {
-      rewritePanel.hidden = true;
-      const res = await post('/api/profile/points/update', {id: p.id, text});
-      flashCount(res.quality_warning
-        ? `Saved -- but ${res.quality_warning.weak_opener ? 'opens on a bare generic verb with no brag' : 'has no brag (no number, award, or named result)'}.`
-        : 'Point updated.');
-      loadProfile();
-    }
     row.querySelector('.pf-save').onclick = async () => {
-      const text = textarea.value.trim();
-      const result = await runRewriteCheck(text, p.company, p.role);
-      renderRewriteReview(rewritePanel, result, {
-        useRewritten: (newText) => { textarea.value = newText; finishSavePoint(newText); },
-        keepOriginal: () => finishSavePoint(text),
-        saveAnyway: () => finishSavePoint(text),
-        retry: () => row.querySelector('.pf-save').click(),
-        dismiss: () => { rewritePanel.hidden = true; },
-      });
+      try {
+        const res = await post('/api/profile/points/update', {id: p.id, text: textarea.value});
+        flashCount(res.quality_warning
+          ? `Saved -- but ${res.quality_warning.weak_opener ? 'opens on a bare generic verb with no brag' : 'has no brag (no number, award, or named result)'}.`
+          : 'Point saved.');
+        loadProfile();
+      } catch (e) { flashCount(e.message); }
     };
     row.querySelector('.pf-toggle').onclick = async () => {
       await post('/api/profile/points/toggle', {id: p.id, active: !p.active});
@@ -818,120 +696,21 @@ document.getElementById('pf-skill-add').onclick = async () => {
   loadProfile();
 };
 
-// ── upload + extract ─────────────────────────────────────────────────
-function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result.split(',')[1]);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-}
-
-async function runExtract(body, triggerBtn) {
-  const status = document.getElementById('pf-upload-status');
-  status.textContent = 'Extracting… (calls the LLM, can take a few seconds)';
-  triggerBtn.disabled = true;
+// A point is added exactly as typed -- nothing rewrites it.
+document.getElementById('pf-add-point').onclick = async () => {
+  const val = id => document.getElementById(id).value.trim();
+  const body = {entry_type: val('pf-np-type'), company: val('pf-np-company'), role: val('pf-np-role'),
+                start_date: val('pf-np-start'), end_date: val('pf-np-end'), text: val('pf-np-text'),
+                tags: val('pf-np-tags')};
   try {
-    const res = await post('/api/profile/extract', body);
-    if (res.error) { status.textContent = 'Error: ' + res.error; return; }
-    const dupeCount = res.proposal.points.filter(p => p.likely_duplicate).length;
-    status.textContent = `Found ${res.proposal.points.length} point(s), ${res.proposal.skills.length} skill(s)`
-      + (dupeCount ? ` (${dupeCount} look like duplicates already on file -- unchecked below).` : '.');
-    document.getElementById('pf-proposal-wrap').hidden = false;
-    renderProposal(res.proposal);
-  } catch (e) {
-    status.textContent = 'Error: ' + e.message;
-  } finally {
-    triggerBtn.disabled = false;
+    await post('/api/profile/points/add', body);
+  } catch (e) { flashCount(e.message); return; }
+  for (const id of ['pf-np-company', 'pf-np-role', 'pf-np-start', 'pf-np-end', 'pf-np-text', 'pf-np-tags']) {
+    document.getElementById(id).value = '';
   }
-}
-
-document.getElementById('pf-upload-btn').onclick = async () => {
-  const file = document.getElementById('pf-upload').files[0];
-  const btn = document.getElementById('pf-upload-btn');
-  if (!file) { document.getElementById('pf-upload-status').textContent = 'Choose a file first.'; return; }
-  const content_base64 = await fileToBase64(file);
-  await runExtract({filename: file.name, content_base64}, btn);
+  flashCount('Point added.');
+  loadProfile();
 };
-
-document.getElementById('pf-paste-toggle').onclick = () => {
-  const box = document.getElementById('pf-paste-box');
-  box.hidden = !box.hidden;
-  document.getElementById('pf-paste-toggle').textContent = box.hidden ? 'or paste text instead →' : '← or upload a file instead';
-};
-document.getElementById('pf-paste-btn').onclick = async () => {
-  const text = document.getElementById('pf-paste-text').value.trim();
-  const btn = document.getElementById('pf-paste-btn');
-  if (!text) { document.getElementById('pf-upload-status').textContent = 'Paste some text first.'; return; }
-  await runExtract({text}, btn);
-};
-
-function renderProposal(proposal) {
-  const el = document.getElementById('pf-proposal');
-  el.innerHTML = `
-    <h3 style="font-size:13px;margin-top:16px">Proposed points (uncheck to skip)</h3>
-    <div id="pf-proposal-points"></div>
-    <h3 style="font-size:13px;margin-top:16px">Proposed skills (uncheck to skip)</h3>
-    <div id="pf-proposal-skills"></div>
-    <button id="pf-commit" class="primary" style="margin-top:12px">Add to master doc</button>
-  `;
-  const pointsEl = document.getElementById('pf-proposal-points');
-  proposal.points.forEach((p, i) => {
-    const row = document.createElement('div');
-    row.className = 'pf-proposal-row';
-    // likely_duplicate comes from the server (difflib against what's
-    // already in the point bank) -- default the checkbox OFF for those so
-    // committing a near-duplicate takes a deliberate re-check, not a miss.
-    const dupeBadge = p.likely_duplicate
-      ? `<span class="dupe-badge" title="Close match: ${esc(p.duplicate_of_text || '')}">possible duplicate</span><br>` : '';
-    // needs_review comes from the LLM itself: it found no real number/
-    // outcome/named result anywhere in the source text for this point, so
-    // it extracted it as written rather than inventing one -- same refuse-
-    // and-ask discipline as the single-bullet rewrite check, surfaced here
-    // instead of silently saving a weak bullet.
-    const reviewBadge = p.needs_review
-      ? `<span class="badge badge-stale" title="${esc(p.review_note || '')}">needs a real result -- ${esc(p.review_note || '')}</span><br>` : '';
-    row.innerHTML = `
-      <input type="checkbox" ${p.likely_duplicate ? '' : 'checked'} data-idx="${i}" class="prop-point-check">
-      <div style="flex:1">
-        ${dupeBadge}
-        ${reviewBadge}
-        <div class="dim" style="font-size:11.5px">${esc(p.company)} / ${esc(p.role)} &middot; ${esc(p.start_date || '?')}&ndash;${esc(p.end_date || 'present')}</div>
-        <textarea data-idx="${i}" class="prop-point-text">${esc(p.text)}</textarea>
-      </div>`;
-    pointsEl.appendChild(row);
-  });
-  const skillsEl = document.getElementById('pf-proposal-skills');
-  proposal.skills.forEach((s, i) => {
-    const row = document.createElement('label');
-    row.style.cssText = 'display:inline-flex;align-items:center;gap:5px;margin:2px 10px 2px 0;font-size:12.5px';
-    row.innerHTML = `<input type="checkbox" checked data-idx="${i}" class="prop-skill-check"> ${esc(s.name)} <span class="dim">(${esc(s.category)})</span>`;
-    skillsEl.appendChild(row);
-  });
-
-  document.getElementById('pf-commit').onclick = async () => {
-    const points = [];
-    document.querySelectorAll('.prop-point-check').forEach(cb => {
-      if (cb.checked) {
-        const i = cb.dataset.idx;
-        const text = document.querySelector(`.prop-point-text[data-idx="${i}"]`).value;
-        points.push({...proposal.points[i], text});
-      }
-    });
-    const skills = [];
-    document.querySelectorAll('.prop-skill-check').forEach(cb => {
-      if (cb.checked) skills.push(proposal.skills[cb.dataset.idx]);
-    });
-    const res = await post('/api/profile/extract/commit', {points, skills});
-    document.getElementById('pf-upload-status').textContent =
-      `Added ${res.added_points} point(s), ${res.added_skills} skill(s) to the master doc`
-      + (res.skipped_dupes ? ` (${res.skipped_dupes} skipped as duplicates).` : '.');
-    document.getElementById('pf-proposal-wrap').hidden = true;
-    document.getElementById('pf-proposal').innerHTML = '';
-    document.getElementById('pf-upload').value = '';
-  };
-}
 
 // ── master document ─────────────────────────────────────────────────
 // A read-only, single-page view of literally everything on file -- the
@@ -1104,7 +883,7 @@ document.getElementById('pf-tg-test').onclick = async () => {
 // this is just so the UI doesn't invite a guest to try.
 const GUEST_DISABLED_BUTTON_IDS = [
   'btn-manual', 'btn-refetch',
-  'pf-upload-btn', 'pf-paste-btn', 'pf-tg-save', 'pf-tg-test',
+  'pf-add-point', 'pf-tg-save', 'pf-tg-test',
 ];
 
 async function loadSession() {

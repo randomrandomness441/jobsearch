@@ -21,6 +21,7 @@ import auth  # noqa: E402
 import db  # noqa: E402
 import links  # noqa: E402
 import llm  # noqa: E402
+import master  # noqa: E402
 import pipeline  # noqa: E402
 import server  # noqa: E402
 import worker  # noqa: E402
@@ -50,12 +51,13 @@ class ServerTest(unittest.TestCase):
         cls.srv.shutdown()
 
     def setUp(self):
-        for t in ("analysis", "application", "jobs", "point_bank", "profile", "users"):
+        for t in ("analysis", "application", "jobs", "users"):
             db._run(f"DELETE FROM {t}" + (" WHERE role != 'admin'" if t == "users" else ""))
         shutil.rmtree(pipeline.FILES_DIR, ignore_errors=True)
         while not worker._queue.empty():
             worker._queue.get()
         self.uid = db.users_get("admin@x.com")["id"]
+        shutil.rmtree(master._dir(), ignore_errors=True)
         self.admin = cookie("admin@x.com")
 
     def call(self, path, body=None, headers=None):
@@ -370,6 +372,76 @@ class ServerTest(unittest.TestCase):
         code, _ = self.call("/api/applications/add-status", {"app_id": a["application_id"], "status": "offer"},
                             headers=cookie("member@x.com"))
         self.assertEqual(code, 400)
+
+    # ── master document: edited by the user, never by an LLM ─────────────
+    def test_the_user_builds_the_master_document_with_plain_writes_and_no_llm_call(self):
+        real = llm.llm_json_call
+        llm.llm_json_call = lambda *a, **k: self.fail("the master document must never call an LLM")
+        try:
+            self.assertEqual(self.call("/api/profile/fields/set", {"key": "name", "value": "Ada"})[0], 200)
+            self.assertEqual(self.call("/api/profile/skills/add", {"name": "Go", "category": "Languages"})[0], 200)
+            code, added = self.call("/api/profile/points/add", {
+                "company": "Acme", "role": "Engineer", "start_date": "2020-01", "text": "Cut p99 by 40%.",
+                "tags": "perf, go"})
+            self.assertEqual(code, 200)
+            self.assertEqual(self.call("/api/profile/points/update", {"id": added["id"], "text": "Cut p99 by 50%."})[0], 200)
+            self.assertEqual(self.call("/api/profile/points/toggle", {"id": added["id"], "active": False})[0], 200)
+        finally:
+            llm.llm_json_call = real
+        doc = json.load(open(master.path(self.uid)))
+        self.assertEqual(doc["profile"]["name"], "Ada")
+        self.assertEqual(doc["points"][0]["text"], "Cut p99 by 50%.")
+        self.assertEqual(doc["points"][0]["tags"], ["go", "perf"])
+        self.assertFalse(doc["points"][0]["active"])
+        _, listed = self.call("/api/profile/points?all=1")
+        self.assertEqual(listed["points"][0]["text"], "Cut p99 by 50%.")
+        self.assertEqual(self.call("/api/profile/points")[1]["points"], [])      # retired ones are hidden by default
+
+    def test_the_llm_master_document_routes_are_gone(self):
+        for path in ("/api/profile/points/rewrite-check", "/api/profile/points/tidy",
+                     "/api/profile/points/tidy-commit", "/api/profile/extract", "/api/profile/extract/commit"):
+            self.assertEqual(self.call(path, {"text": "x"})[0], 404, path)
+
+    def test_adding_a_point_validates_its_input(self):
+        ok = {"company": "A", "role": "r", "text": "t"}
+        for bad in ({**ok, "text": " "}, {**ok, "company": ""}, {**ok, "entry_type": "hobby"}):
+            self.assertEqual(self.call("/api/profile/points/add", bad)[0], 400, bad)
+        self.assertEqual(self.call("/api/profile/points/update", {"id": 999, "text": "x"})[0], 400)
+        self.assertFalse(os.path.exists(master.path(self.uid)))
+
+    def test_point_quality_hint_is_returned_but_never_blocks_the_save(self):
+        _, added = self.call("/api/profile/points/add", {"company": "A", "role": "r", "text": "Worked on stuff"})
+        code, body = self.call("/api/profile/points/update", {"id": added["id"], "text": "Helped with things"})
+        self.assertEqual(code, 200)
+        self.assertIsNotNone(body["quality_warning"])
+        self.assertEqual(master.point_bank_all(self.uid)[0]["text"], "Helped with things")
+
+    def test_a_guest_cannot_write_a_master_document(self):
+        guest = cookie("guest@x.com")
+        for path, body in (("/api/profile/points/add", {"company": "A", "role": "r", "text": "t"}),
+                           ("/api/profile/fields/set", {"key": "name", "value": "x"}),
+                           ("/api/profile/skills/add", {"name": "Go", "category": "x"})):
+            self.assertEqual(self.call(path, body, headers=guest)[0], 403, path)
+        self.assertFalse(os.path.exists(master._dir()) and os.listdir(master._dir()))
+
+    def test_removing_a_user_deletes_their_master_document_but_an_admin_is_never_removed(self):
+        bob = db.users_add("bob@x.com")["id"]
+        master.profile_set(bob, "name", "Bob")
+        master.profile_set(self.uid, "name", "Admin")
+        self.call("/api/admin/users/remove", {"email": "bob@x.com"})
+        self.assertFalse(os.path.exists(master.path(bob)))
+        self.call("/api/admin/users/remove", {"email": "admin@x.com"})
+        self.assertTrue(os.path.exists(master.path(self.uid)))
+        self.assertIsNotNone(db.users_get("admin@x.com"))
+
+    def test_a_resume_is_generated_from_the_file_the_user_edited(self):
+        """The poller path reads the same file the Profile tab writes."""
+        for k, v in {"name": "A", "title": "T", "email": "e", "phone": "1", "linkedin": "l", "github": "g",
+                     "education": "e"}.items():
+            self.call("/api/profile/fields/set", {"key": k, "value": v})
+        self.assertEqual([u["id"] for u in worker.ready_users()], [])           # no experience yet
+        self.call("/api/profile/points/add", {"company": "Acme", "role": "Eng", "text": "Did a thing."})
+        self.assertEqual([u["id"] for u in worker.ready_users()], [self.uid])
 
     # ── static files ─────────────────────────────────────────────────────
     def test_static_serving_cannot_escape_the_static_directory(self):

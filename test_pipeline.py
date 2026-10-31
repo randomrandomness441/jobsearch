@@ -15,6 +15,7 @@ os.environ["ALLOWED_LOGIN_EMAIL"] = "admin@x.com"
 
 import db  # noqa: E402
 import llm  # noqa: E402
+import master  # noqa: E402
 import pipeline  # noqa: E402
 
 PROFILE = {"name": "Test Person", "title": "Software Engineer", "email": "t@x.com", "phone": "555-0100",
@@ -29,10 +30,11 @@ class Fake:
     """Scripted llm.llm_json_call. mode: ok | none | timeout."""
 
     def __init__(self, mode="ok"):
-        self.mode, self.calls = mode, []
+        self.mode, self.calls, self.prompts = mode, [], []
 
     def __call__(self, system, messages, tuning, max_tokens=0, temperature=0):
         self.calls.append(tuning)
+        self.prompts.append(messages[0]["content"])
         if self.mode == "timeout":
             llm._local.exceeded = True
             return None, None
@@ -63,14 +65,15 @@ class Fake:
 
 class PipelineTest(unittest.TestCase):
     def setUp(self):
-        for t in ("analysis", "jobs", "point_bank", "skills", "profile", "users"):
+        for t in ("analysis", "jobs", "users"):
             db._run(f"DELETE FROM {t}" + (" WHERE role != 'admin'" if t == "users" else ""))
         self.uid = db.users_get("admin@x.com")["id"]
+        master.delete(self.uid)
         for k, v in PROFILE.items():
-            db.profile_set(self.uid, k, v)
-        db.skills_add(self.uid, "Python", "Languages")
+            master.profile_set(self.uid, k, v)
+        master.skills_add(self.uid, "Python", "Languages")
         for b in BULLETS:
-            db.point_bank_add(self.uid, "Acme", "Engineer", "2020", None, b)
+            master.point_bank_add(self.uid, "Acme", "Engineer", "2020", None, b)
         self.job_id, _ = db.jobs_add("greenhouse", "42", "Acme", "Senior Software Engineer", "https://x/42",
                                      "Python backend role in Bengaluru.", "Bengaluru, India")
         db.analysis_ensure(self.uid, self.job_id)
@@ -128,7 +131,9 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual({(s["step"], s["ok"]) for s in a["steps"]}, {("score", 1), ("select", 1), ("draft", 0)})
 
     def test_missing_profile_fails_immediately_without_retries(self):
-        db._run("DELETE FROM profile WHERE user_id = ? AND key = 'phone'", self.uid)
+        doc = master.load(self.uid)
+        del doc["profile"]["phone"]
+        master.save(self.uid, doc)
         self.assertEqual(self.run_job(), "failed")
         a = db.analysis_get(self.uid, self.job_id)
         self.assertEqual((a["error_kind"], a["attempts"]), ("invalid", 1))
@@ -136,7 +141,8 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(self.fake.calls, [])                                       # never reached the LLM
 
     def test_empty_master_document_fails_immediately(self):
-        db._run("UPDATE point_bank SET active = 0 WHERE user_id = ?", self.uid)
+        for p in master.point_bank_all(self.uid):
+            master.point_bank_set_active(self.uid, p["id"], False)
         self.assertEqual(self.run_job(), "failed")
         self.assertIn("master document", db.analysis_get(self.uid, self.job_id)["error_msg"])
 
@@ -162,6 +168,43 @@ class PipelineTest(unittest.TestCase):
             pid = int(f.read())
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)                                                         # the grandchild is dead too
+
+    def test_a_broken_master_document_fails_immediately_and_says_why(self):
+        with open(master.path(self.uid), "w") as f:
+            f.write("{ this is not json")
+        self.assertEqual(self.run_job(), "failed")
+        a = db.analysis_get(self.uid, self.job_id)
+        self.assertEqual((a["error_kind"], a["attempts"]), ("invalid", 1))
+        self.assertIn("master document", a["error_msg"])
+        self.assertEqual(self.fake.calls, [])
+
+    def test_the_user_editing_the_master_document_changes_the_next_run_with_no_cache(self):
+        self.assertEqual(self.run_job(), "done")
+        self.assertFalse(any("Staff Wizard" in p for p in self.fake.prompts))
+        master.profile_set(self.uid, "title", "Staff Wizard")
+        db.analysis_regenerate(self.uid, self.job_id)
+        self.assertEqual(self.run_job(), "done")
+        self.assertTrue(any("Staff Wizard" in p for p in self.fake.prompts))
+
+    def test_evidence_and_project_ids_are_checked_against_the_users_own_document(self):
+        proj = master.point_bank_add(self.uid, "Kapitsa", "A tagline", "2023", "2024", "Built a thing.", entry_type="project")
+        fake = Fake()
+        real_call = fake.__call__
+
+        def with_project(system, messages, tuning, **kw):
+            reply, provider = real_call(system, messages, tuning, **kw)
+            if tuning == "score":
+                obj = json.loads(reply)
+                obj["project_assessment"] = [{"item_id": proj, "worth_including": True, "reason": "fits"},
+                                              {"item_id": 424242, "worth_including": True, "reason": "made up"}]
+                reply = json.dumps(obj)
+            return reply, provider
+        llm.llm_json_call = with_project
+        self.assertTrue(db.analysis_claim(self.uid, self.job_id))
+        self.assertEqual(pipeline.process_one(self.uid, self.job_id), "done")
+        a = db.analysis_get(self.uid, self.job_id)
+        self.assertEqual([(p["point_id"], p["name"]) for p in a["projects"]], [(proj, "Kapitsa")])   # the invented id is dropped
+        self.assertIsNone(a["requirements"][1]["evidence_point_id"])
 
     def test_regenerate_replaces_files_and_never_leaves_a_gap(self):
         self.assertEqual(self.run_job(), "done")

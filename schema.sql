@@ -16,7 +16,7 @@ PRAGMA journal_mode = WAL;
 PRAGMA busy_timeout = 5000;
 
 CREATE TABLE IF NOT EXISTS users (
-    id       INTEGER PRIMARY KEY,
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,      -- never reused: a master document file is named by it
     email    TEXT NOT NULL UNIQUE COLLATE NOCASE,
     role     TEXT NOT NULL DEFAULT 'whitelisted' CHECK (role IN ('admin', 'whitelisted')),
     added_ts REAL NOT NULL
@@ -29,40 +29,9 @@ CREATE TABLE IF NOT EXISTS telegram_config (
     updated_ts REAL NOT NULL
 );
 
--- The user's master document.
-CREATE TABLE IF NOT EXISTS profile (
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    key     TEXT NOT NULL,
-    value   TEXT NOT NULL,
-    PRIMARY KEY (user_id, key)
-);
-
-CREATE TABLE IF NOT EXISTS skills (
-    user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    name     TEXT NOT NULL COLLATE NOCASE,      -- "Embeddings" and "embeddings" are one skill
-    category TEXT NOT NULL,
-    active   INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
-    PRIMARY KEY (user_id, name)
-);
-
-CREATE TABLE IF NOT EXISTS point_bank (
-    id         INTEGER PRIMARY KEY,
-    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    entry_type TEXT NOT NULL DEFAULT 'role' CHECK (entry_type IN ('role', 'project')),
-    company    TEXT NOT NULL,                   -- a project's name when entry_type = 'project'
-    role       TEXT NOT NULL,                   -- a project's tagline when entry_type = 'project'
-    start_date TEXT NOT NULL,
-    end_date   TEXT,                            -- NULL = current
-    text       TEXT NOT NULL,
-    active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))   -- 0 = retired, kept for history
-);
-CREATE INDEX IF NOT EXISTS idx_point_bank_user ON point_bank(user_id, active);
-
-CREATE TABLE IF NOT EXISTS point_tag (
-    point_id INTEGER NOT NULL REFERENCES point_bank(id) ON DELETE CASCADE,
-    tag      TEXT NOT NULL COLLATE NOCASE,
-    PRIMARY KEY (point_id, tag)
-);
+-- The user's master document (profile, skills, point bank) is NOT in this
+-- database: it is one JSON file per user, data/master/<user_id>.json, written
+-- only by the user (master.py). Analysis rows below refer to its points by id.
 
 -- Shared by every user: one row per posting.
 CREATE TABLE IF NOT EXISTS jobs (
@@ -115,7 +84,7 @@ CREATE TABLE IF NOT EXISTS analysis_requirement (
     importance        TEXT NOT NULL CHECK (importance IN ('required', 'nice_to_have')),
     presence          TEXT NOT NULL CHECK (presence IN ('yes', 'semantic', 'no')),
     depth             TEXT NOT NULL CHECK (depth IN ('quantified', 'named', 'n/a')),
-    evidence_point_id INTEGER REFERENCES point_bank(id) ON DELETE SET NULL,
+    evidence_point_id INTEGER,                   -- a point id in the user's master document, or NULL
     weight            INTEGER NOT NULL CHECK (weight BETWEEN 0 AND 100),
     earned            INTEGER NOT NULL CHECK (earned >= 0 AND earned <= weight),
     PRIMARY KEY (user_id, job_id, pos),
@@ -136,7 +105,8 @@ CREATE TABLE IF NOT EXISTS analysis_gap (
 CREATE TABLE IF NOT EXISTS analysis_project (
     user_id         INTEGER NOT NULL,
     job_id          INTEGER NOT NULL,
-    point_id        INTEGER NOT NULL REFERENCES point_bank(id) ON DELETE CASCADE,
+    point_id        INTEGER NOT NULL,            -- a point id in the user's master document
+    name            TEXT NOT NULL,               -- the project's name, as it was when assessed
     worth_including INTEGER NOT NULL CHECK (worth_including IN (0, 1)),
     reason          TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (user_id, job_id, point_id),
@@ -148,7 +118,7 @@ CREATE TABLE IF NOT EXISTS analysis_item (
     user_id  INTEGER NOT NULL,
     job_id   INTEGER NOT NULL,
     pos      INTEGER NOT NULL,
-    point_id INTEGER NOT NULL REFERENCES point_bank(id) ON DELETE CASCADE,
+    point_id INTEGER NOT NULL,                   -- a point id in the user's master document
     kind     TEXT NOT NULL CHECK (kind IN ('role', 'project')),
     text     TEXT NOT NULL,                     -- possibly a truthful reword of the point's own text
     PRIMARY KEY (user_id, job_id, pos),

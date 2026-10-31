@@ -31,6 +31,7 @@ import traceback
 import db
 import humanizer
 import llm
+import master
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 FILES_DIR = os.path.join(db.DATA_DIR, "files")
@@ -710,7 +711,10 @@ def master_doc_problem(profile, point_bank):
 
 
 def master_doc_ready(user_id):
-    return master_doc_problem(db.profile_all(user_id), db.point_bank_all(user_id)) is None
+    try:
+        return master_doc_problem(master.profile_all(user_id), master.point_bank_all(user_id)) is None
+    except ValueError:
+        return False
 
 
 def job_dir(user_id, company, job_id):
@@ -750,9 +754,10 @@ def _step(user_id, job_id, attempt, name, fn):
                              usage=llm.take_usage(), error=error)
 
 
-def _clean_requirements(requirements):
+def _clean_requirements(requirements, known_point_ids):
     """Coerce the model's free-text enums into the values the table allows
-    (a bad value should cost a default, not the whole run)."""
+    (a bad value should cost a default, not the whole run), and keep an
+    evidence point id only if it is a real point in this user's master document."""
     out = []
     for r in requirements:
         text = str(r.get("requirement", "")).strip()
@@ -762,6 +767,8 @@ def _clean_requirements(requirements):
         try:
             evidence = int(r["evidence_item_id"])
         except (KeyError, TypeError, ValueError):
+            evidence = None
+        if evidence not in known_point_ids:
             evidence = None
         out.append({
             "requirement": text,
@@ -822,12 +829,13 @@ def _run(user_id, job_id, attempt, tmp_dir):
     job = db.jobs_get(job_id)
     if job is None:
         raise StepError("invalid", "job no longer exists", permanent=True)
-    profile = db.profile_all(user_id)
-    point_bank = db.point_bank_all(user_id)
+    try:
+        profile, point_bank, skills = master.profile_all(user_id), master.point_bank_all(user_id), master.skills_all(user_id)
+    except ValueError as e:                  # the file was edited into something unreadable
+        raise StepError("invalid", f"master document: {e}", permanent=True)
     problem = master_doc_problem(profile, point_bank)
     if problem:
         raise StepError("invalid", problem, permanent=True)
-    skills = db.skills_all(user_id)
     skill_names = [s["name"] for s in skills]
     try:
         years = float(profile.get("years_experience") or 0)
@@ -856,12 +864,13 @@ def _run(user_id, job_id, attempt, tmp_dir):
 
     def rel(name):
         return os.path.relpath(os.path.join(final, name), db.DATA_DIR)
+    known_ids = {p["id"] for p in point_bank}
     db.analysis_complete(
         user_id, job_id, scored["score"], scored["reason"], provider, rel("resume.pdf"), rel("cover_letter.pdf"),
-        requirements=_clean_requirements(scored["requirements"]),
+        requirements=_clean_requirements(scored["requirements"], known_ids),
         gaps=[g for g in scored["missing"] if g["gap"]],
-        projects=[{"point_id": p["row_id"], "worth_including": p["worth_including"], "reason": p["reason"]}
-                  for p in scored["project_assessment"]],
+        projects=[{"point_id": p["row_id"], "name": p["name"], "worth_including": p["worth_including"],
+                   "reason": p["reason"]} for p in scored["project_assessment"]],
         items=rendered["items"])
 
 
