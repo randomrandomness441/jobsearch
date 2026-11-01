@@ -120,14 +120,15 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual([u["id"] for u in worker.ready_users()], [self.uid])   # bob has no master doc
         import fetch_ats
         real = fetch_ats.main
-        fetch_ats.main = lambda: (mkjob("f1"), mkjob("f2", title="Product Designer"),
-                                  {"new": 2, "seen": 0, "errors": 0})[2]
+        fetch_ats.main = lambda: (mkjob("f1"), mkjob("f2"),
+                                  {"new": 2, "seen": 0, "errors": 0, "skipped_location": 0, "skipped_title": 0,
+                                   "skipped_age": 0})[2]
         try:
             self.assertTrue(worker.run_fetch())
         finally:
             fetch_ats.main = real
-        self.assertEqual(worker.fetch_state["rows_created"], 1)             # the designer role isn't eligible
-        self.assertEqual(db._all("SELECT user_id FROM analysis"), [{"user_id": self.uid}])
+        self.assertEqual(worker.fetch_state["rows_created"], 2)             # whatever the fetch stored, for the ready user only
+        self.assertEqual({r["user_id"] for r in db._all("SELECT user_id FROM analysis")}, {self.uid})
         self.assertTrue(worker.fetch_state["ok"])
         self.assertIsNone(db._one("SELECT 1 AS x FROM analysis WHERE user_id = ?", bob))
 

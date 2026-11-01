@@ -2,7 +2,7 @@
 
     fetch thread    every FETCH_EVERY_SECONDS (or on demand): pull the ATS
                     boards, then give every ready user a pending analysis row
-                    for each new eligible posting.
+                    for each posting they don't have one for.
     worker thread   strictly one job at a time -- the LLM has no concurrency
                     to spare. When its in-memory queue is empty it asks the
                     database for pending/retry rows, claims them (-> in_process)
@@ -35,7 +35,6 @@ import pipeline
 BATCH = 20                       # rows claimed per refill
 IDLE_SECONDS = 5                 # how long the worker waits on an empty queue before polling the DB again
 FETCH_EVERY_SECONDS = 15 * 60
-NEW_ROW_WINDOW_DAYS = 14         # only postings first seen this recently get rows created for a user
 MANUAL, AUTO = 0, 1              # queue priorities; lower runs first
 
 _queue = queue.PriorityQueue()
@@ -43,7 +42,8 @@ _seq = itertools.count()         # tie-breaker: first in, first out within a pri
 _current = None                  # (user_id, job_id) the worker is running right now
 _fetch_wanted = threading.Event()
 fetch_state = {"running": False, "started_ts": None, "finished_ts": None, "ok": None,
-               "new": 0, "seen": 0, "errors": 0, "rows_created": 0, "error": ""}
+               "new": 0, "seen": 0, "errors": 0, "skipped_location": 0, "skipped_title": 0,
+               "skipped_age": 0, "rows_created": 0, "error": ""}
 
 
 def enqueue(user_id, job_id, manual):
@@ -129,7 +129,7 @@ def run_fetch():
     fetch_state.update(running=True, started_ts=time.time(), ok=None, error="")
     try:
         summary = fetch_ats.main()
-        created = db.analysis_enqueue_missing(time.time() - NEW_ROW_WINDOW_DAYS * 86400, users=ready_users())
+        created = db.analysis_enqueue_missing(users=ready_users())
         fetch_state.update(ok=True, rows_created=created, **summary)
     except Exception as e:
         traceback.print_exc()

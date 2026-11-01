@@ -55,8 +55,7 @@ def connect():
     con.execute("PRAGMA foreign_keys = ON")
     # The same classifiers ats.py already has, callable from SQL so the
     # Postings filter runs in the WHERE clause instead of a Python loop.
-    con.create_function("IS_ENGINEERING_TITLE", 1,
-                        lambda title: 1 if ats.is_likely_engineering_title(title or "") else 0)
+    con.create_function("IS_TARGET_TITLE", 1, lambda title: 1 if ats.is_target_title(title or "") else 0)
     con.create_function("SENIORITY_TIER", 1, lambda title: ats.title_seniority_tier(title or ""))
     if not _ready:
         _init(con)
@@ -182,7 +181,7 @@ def _job_filter(user_id, status=None, eng_only=True, level_tiers=None, min_score
         where.append("a.status = ?")
         params.append(status)
     if eng_only:
-        where.append("(j.source = 'manual' OR IS_ENGINEERING_TITLE(j.title) = 1)")
+        where.append("(j.source = 'manual' OR IS_TARGET_TITLE(j.title) = 1)")
     if level_tiers:
         where.append(f"SENIORITY_TIER(j.title) IN ({','.join('?' * len(level_tiers))})")
         params.extend(level_tiers)
@@ -238,25 +237,21 @@ def analysis_ensure(user_id, job_id):
                 user_id, job_id, time.time())
 
 
-def analysis_enqueue_missing(since_ts, users=None):
-    """For each user (default: all), a pending analysis row for each eligible
-    posting first seen at or after since_ts that they don't have one for yet.
-    Idempotent: run it after every fetch. Manual jobs are skipped here --
-    they're enqueued explicitly by whoever added them. Returns how many rows
-    were created."""
+def analysis_enqueue_missing(users=None):
+    """For each user (default: all), a pending analysis row for every fetched
+    posting they don't have one for yet. Nothing is filtered here: the fetch
+    only stores postings worth a resume. Idempotent -- run it after every
+    fetch. Manual jobs are skipped; whoever added one enqueues it explicitly.
+    Returns how many rows were created."""
     created = 0
     for user in (users if users is not None else users_all()):
-        # is_target_location only reads the first 500 chars, so that's all we load
-        rows = _all(
-            "SELECT j.id, j.title, j.location, substr(j.description_raw, 1, 500) AS head FROM jobs j "
-            "WHERE j.first_seen_ts >= ? AND j.source != 'manual' AND NOT EXISTS "
-            "(SELECT 1 FROM analysis a WHERE a.user_id = ? AND a.job_id = j.id)", since_ts, user["id"])
-        now = time.time()
-        ids = [(user["id"], r["id"], now) for r in rows if ats.is_eligible(r["title"], r["location"], r["head"])]
         with tx() as con:
-            con.executemany("INSERT INTO analysis (user_id, job_id, created_ts) VALUES (?,?,?) "
-                            "ON CONFLICT DO NOTHING", ids)
-        created += len(ids)
+            cur = con.execute(
+                "INSERT INTO analysis (user_id, job_id, created_ts) "
+                "SELECT ?, j.id, ? FROM jobs j WHERE j.source != 'manual' AND NOT EXISTS "
+                "(SELECT 1 FROM analysis a WHERE a.user_id = ? AND a.job_id = j.id) ORDER BY j.first_seen_ts",
+                (user["id"], time.time(), user["id"]))
+            created += cur.rowcount
     return created
 
 

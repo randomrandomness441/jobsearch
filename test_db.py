@@ -41,14 +41,23 @@ class DbTest(unittest.TestCase):
     def test_manual_external_id_is_content_identity(self):
         self.assertEqual(db.manual_external_id("A", "T", "x  y"), db.manual_external_id("a", "t", "X Y"))
 
-    def test_enqueue_missing_is_idempotent_and_filters(self):
+    def test_enqueue_missing_gives_every_user_a_row_per_posting_once(self):
         mkjob("1")
-        mkjob("2", title="Product Designer")                 # not engineering
-        mkjob("3", loc="Austin, US")                          # wrong location
-        mkjob("4", title="Engineering Manager")               # manager tier
-        self.assertEqual(db.analysis_enqueue_missing(0), 2)   # job 1 for admin and bob
-        self.assertEqual(db.analysis_enqueue_missing(0), 0)   # second run creates nothing
-        self.assertEqual(len(db.analysis_pending()), 2)
+        mkjob("2")
+        self.assertEqual(db.analysis_enqueue_missing(), 4)          # 2 postings x (admin, bob)
+        self.assertEqual(db.analysis_enqueue_missing(), 0)          # second run creates nothing
+        self.assertEqual(len(db.analysis_pending()), 4)
+        mkjob("3")
+        self.assertEqual(db.analysis_enqueue_missing(), 2)          # only the new posting
+        db.analysis_claim(self.admin, 1)
+        db.analysis_enqueue_missing()
+        self.assertEqual(db.analysis_get(self.admin, 1)["status"], "in_process")   # never reset
+
+    def test_enqueue_missing_skips_manual_postings_and_limits_to_the_given_users(self):
+        mkjob("1")
+        mkjob("m", source="manual")
+        self.assertEqual(db.analysis_enqueue_missing(users=[db.users_get("admin@x.com")]), 1)
+        self.assertEqual(db._all("SELECT user_id FROM analysis"), [{"user_id": self.admin}])
 
     def test_claim_is_exclusive_even_across_threads(self):
         jid, _ = mkjob("1")

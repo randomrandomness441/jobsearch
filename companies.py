@@ -111,7 +111,7 @@ COMPANIES = [
     # any of the three providers.
     #
     # First pass only checked "has an India posting" -- too loose. Re-ran
-    # with the real is_likely_engineering_title() check against each live
+    # with the real is_target_title() check against each live
     # posting and dropped every company whose only India postings turned
     # out to be non-engineering once actually read: Agency (833 postings,
     # all "Freelance AI Trainer Project" gig-marketplace work, likely a

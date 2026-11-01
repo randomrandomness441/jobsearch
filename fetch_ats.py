@@ -22,29 +22,18 @@ import time
 import urllib.error
 import urllib.request
 
+import ats as classify
 import db
 from companies import COMPANIES
 
-# Fetch-time filter, applied before a posting ever reaches the db: only
-# India/Bangalore/Bengaluru (incl. "Remote - India"), only posted within
-# the last month. Sourav's own words: "fetch the jobs by location or date,
-# maximum can be a month, thats it" -- don't clutter the db with the other
-# ~95% of each board (mostly US/EU postings) until there's a reason to look
-# at them. Title is deliberately NOT filtered here -- that's the level /
-# "engineering roles only" controls in the UI, a different job.
-_INDIA_WORDS = ("india", "bangalore", "bengaluru")
-_INDIA_RE = re.compile(r"\b(" + "|".join(_INDIA_WORDS) + r")\b", re.IGNORECASE)
+# Everything that decides whether a posting is stored lives here, at fetch
+# time, so what is in the database is exactly what should get a resume:
+#   location   Bengaluru / Bangalore / Remote          (ats.is_target_location)
+#   title      engineering role, not manager tier      (ats.is_wanted)
+#   age        posted within MAX_POSTING_AGE_DAYS
+# Nothing downstream re-checks any of it.
 MAX_POSTING_AGE_DAYS = 30
-
-
-def is_target_location(location, description=""):
-    # \b word-boundary match -- a plain substring check would match
-    # "Indiana" on "india", a real false positive hit in fetched data.
-    if location and _INDIA_RE.search(location):
-        return True
-    if not location and description:
-        return bool(_INDIA_RE.search(description[:500]))
-    return False
+is_target_location = classify.is_target_location
 
 
 def _get(url):
@@ -167,67 +156,52 @@ def _fetch_one(row):
 
 
 def main():
-    """Fetch every company, store what's new, bump last_seen on what's already
-    tracked. Returns {"new", "seen", "errors"}."""
-    total_new, total_dup, total_err, total_skip_loc, total_skip_age = 0, 0, 0, 0, 0
+    """Fetch every company, store what passes the filters, bump last_seen on
+    what is already tracked. Returns counts for the status line."""
+    total = {"new": 0, "seen": 0, "errors": 0, "skipped_location": 0, "skipped_title": 0, "skipped_age": 0}
     cutoff = time.time() - MAX_POSTING_AGE_DAYS * 86400
 
-    # Fetch all ~96 companies concurrently -- independent HTTP calls to
-    # different hosts, pure I/O wait, nothing shared between them. Measured
-    # live: the old serial loop (with its 0.5s-per-company "be polite"
-    # sleep, which was never protecting against anything real -- no 429s
-    # at any concurrency tested) took ~114s for a full run; 10 workers took
-    # ~8-13s, zero errors. DB writes below stay sequential, one company at
-    # a time, in this thread -- SQLite's default rollback-journal mode
-    # serializes concurrent writers with no busy_timeout set, so writing
-    # from multiple threads at once risked a real "database is locked"
-    # error for no actual gain (each write already measured ~0.2ms, never
-    # the bottleneck -- the network fetch was).
+    # The ~96 boards are independent hosts, so the network calls run on a pool;
+    # the database writes below stay in this one thread.
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
         fetched = list(ex.map(_fetch_one, COMPANIES))
 
-    for name, ats, slug, postings, err in fetched:
+    for name, ats_name, slug, postings, err in fetched:
         if err is not None:
             if isinstance(err, urllib.error.HTTPError):
-                print(f"[{ats:10}] {name:20} slug '{slug}' -> HTTP {err.code} (wrong slug, or board closed)")
+                print(f"[{ats_name:10}] {name:20} slug '{slug}' -> HTTP {err.code} (wrong slug, or board closed)")
             else:
-                print(f"[{ats:10}] {name:20} slug '{slug}' -> ERROR {err}")
-            total_err += 1
+                print(f"[{ats_name:10}] {name:20} slug '{slug}' -> ERROR {err}")
+            total["errors"] += 1
             continue
 
-        new_here, dup_here, skip_loc, skip_age = 0, 0, 0, 0
+        here = {"new": 0, "seen": 0, "skipped_location": 0, "skipped_title": 0, "skipped_age": 0}
         for p in postings:
             if not p["description_raw"]:
                 continue
-            if not is_target_location(p.get("location", ""), p["description_raw"]):
-                skip_loc += 1
-                continue
-            # A posting whose date we couldn't parse is kept rather than
-            # silently dropped -- we can't confirm it's stale, and staying
-            # silent about a parse failure is worse than an occasional old
-            # row slipping through.
-            posted_ts = p.get("posted_ts")
-            if posted_ts is not None and posted_ts < cutoff:
-                skip_age += 1
-                continue
-            _, is_new = db.jobs_add(ats, p["external_id"], name, p["title"], p["url"], p["description_raw"],
-                                     p.get("location", ""), posted_ts)
-            if is_new:
-                new_here += 1
+            location = p.get("location", "")
+            if not classify.is_target_location(location, p["description_raw"]):
+                here["skipped_location"] += 1
+            elif not classify.is_wanted(p["title"], location, p["description_raw"]):
+                here["skipped_title"] += 1
+            # A posting whose date couldn't be read is kept: we can't confirm
+            # it's stale, and dropping it silently is worse than an old row.
+            elif p.get("posted_ts") is not None and p["posted_ts"] < cutoff:
+                here["skipped_age"] += 1
             else:
-                dup_here += 1
-        total_new += new_here
-        total_dup += dup_here
-        total_skip_loc += skip_loc
-        total_skip_age += skip_age
-        print(f"[{ats:10}] {name:20} {len(postings):4} postings -> {new_here} new, {dup_here} already tracked, "
-              f"{skip_loc} outside India, {skip_age} older than {MAX_POSTING_AGE_DAYS}d")
+                _, is_new = db.jobs_add(ats_name, p["external_id"], name, p["title"], p["url"], p["description_raw"],
+                                        location, p.get("posted_ts"))
+                here["new" if is_new else "seen"] += 1
+        for k, v in here.items():
+            total[k] += v
+        print(f"[{ats_name:10}] {name:20} {len(postings):4} postings -> {here['new']} new, {here['seen']} already tracked, "
+              f"{here['skipped_location']} wrong location, {here['skipped_title']} wrong title, "
+              f"{here['skipped_age']} older than {MAX_POSTING_AGE_DAYS}d")
 
-    print(f"\ntotal: {total_new} new job rows added, {total_dup} already-tracked duplicates skipped, "
-          f"{total_skip_loc} skipped (outside India, never saved), "
-          f"{total_skip_age} skipped (older than {MAX_POSTING_AGE_DAYS}d, never saved), "
-          f"{total_err} sources errored")
-    return {"new": total_new, "seen": total_dup, "errors": total_err}
+    print(f"\ntotal: {total['new']} new, {total['seen']} already tracked, {total['skipped_location']} wrong location, "
+          f"{total['skipped_title']} wrong title, {total['skipped_age']} older than {MAX_POSTING_AGE_DAYS}d, "
+          f"{total['errors']} sources errored")
+    return total
 
 
 if __name__ == "__main__":

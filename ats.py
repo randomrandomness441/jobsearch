@@ -1,112 +1,35 @@
-"""Classifiers over a posting's title and location: is it an engineering role,
-how senior, is it in the target location -- plus the one writing check the
+"""Classifiers over a posting's title and location: is it a title we apply for,
+how senior, is it in a wanted location -- plus the one writing check the
 master-document editor uses (does a bullet carry a brag)."""
 
 import re
 
 
-# Previously a DENYLIST (title is "engineering" unless it contains one of
-# ~30 known non-eng phrases) -- replaced after a real audit found 30+ junk
-# titles slipping through it unnoticed across the live fetched data: Credit
-# Risk Operations Associate, Accounts Payable Analyst, Chief of Staff,
-# Executive Business Partner, Legal Entity Controller, Real Estate Analyst,
-# Fraud Operations Team Lead, India Tax Lead, and "ML Annotation QA Engineer"
-# (contains "Engineer" but is a data-labeling QA role, not software) among
-# many others -- a denylist can only ever block phrasings someone already
-# thought to list, and the real world has far more non-engineering job
-# families than anyone will enumerate. Flipped to an ALLOWLIST instead: a
-# title has to actually look like a real software/data/ML/infra engineering
-# role (the actual target), not merely avoid looking like something else.
-#
-# Two rounds of this still leaked (QA Engineer - Endpoint; AI GTM Engineer,
-# a marketing-ops role that only matched via a sloppy "AI within 20 chars of
-# Engineer" proximity pattern; Associate Lead Data Scientist; Applied AI
-# Architect, a customer-facing deployment role -- all confirmed by reading
-# the real posting body, not title alone). The proximity patterns are gone,
-# QA/Data-Scientist patterns are gone, and "architect" is now only allowed
-# after software/backend/frontend/fullstack (not bare ai/ml/data + architect,
-# which was pulling in consulting-flavored roles). "Applied AI" is denied
-# outright: checked 4 real "Applied AI Engineer/Architect" postings across
-# OpenAI/Anthropic and 3 of 4 were partner/customer-facing (only "GTM Growth
-# Engineering" was genuine hands-on SWE) -- title text alone can't tell
-# those apart (same prefix, different team mission in the JD body), so this
-# defaults to excluding the whole family rather than risk more of the
-# partner-facing majority.
-#
-# This is a structural limit, not something more regex tuning fixes: a
-# title-only classifier cannot always know a role's real function when two
-# teams at the same company use near-identical title phrasing for different
-# jobs. Verified against all 6,252 distinct titles in the live fetched set --
-# every title below was read, not sampled, for the final round; "IT Controls
-# Data Engineer" / "IT Software Engineer, Infrastructure" / "Sr. IT Site
-# Reliability Software Engineer" remain medium-confidence (plausible real
-# infra roles, not individually read against their JD body) rather than
-# fully verified.
-_ENG_TITLE_ALLOW = [
-    re.compile(r"\bsoftware\s+(development\s+)?engineer", re.I),
-    re.compile(r"\bengineer,?\s*software\b", re.I),
-    re.compile(r"\bsoftware\s+developer\b", re.I),
-    re.compile(r"\bsoftware\s+architect\b", re.I),
-    re.compile(r"\bsde[\s-]?(1|2|3|i|ii|iii)?\b", re.I),
-    re.compile(r"\bswe\b", re.I),   # common abbreviation (Meta, Pinterest, ...), same as SDE/SDET above
-    re.compile(r"\bsdet\b", re.I),
-    re.compile(r"\b(backend|frontend|front-end|back-end|full[\s-]?stack)\s+(software\s+)?(engineer|developer|architect)\b", re.I),
-    re.compile(r"\bengineer\b.*\b(backend|frontend|full[\s-]?stack)\b", re.I),
-    re.compile(r"\b(data|ml|machine learning|ai|platform|infrastructure|infra|site reliability|sre|devops|dev ops|release|security|cloud)\s+(software\s+)?engineer\b", re.I),
+# The titles we apply for. A title must contain one of these phrases:
+#   software engineer   (so also Senior / Staff / Software Engineer 2 / II)
+#   SDE 1, 2 or 3       (SDE-2, SDE2, SDE II, SDE III ...)
+#   backend engineer    (also Back-end / Back End)
+#   data engineer
+#   member of technical staff, or MTS
+# Years of experience in the description are deliberately not looked at.
+_TARGET_TITLE_PATTERNS = [
+    re.compile(r"\bsoftware\s+engineer\b", re.I),
+    re.compile(r"\bback[\s-]?end\s+engineer\b", re.I),
+    re.compile(r"\bdata\s+engineer\b", re.I),
+    re.compile(r"\bsde[\s-]?(1|2|3|iii|ii|i)\b", re.I),
     re.compile(r"\bmember\s+of\s+technical\s+staff\b", re.I),
     re.compile(r"\bmts\b", re.I),
-    re.compile(r"\bmachine\s+learning\s+engineer\b", re.I),
-    re.compile(r"\bapplication(s)?\s+engineer\b", re.I),
-    re.compile(r"\bsite\s+reliability\s+engineer\b", re.I),
-    re.compile(r"\bdevops\s+engineer\b", re.I),
-    re.compile(r"\brelease\s+engineer\b", re.I),
-    re.compile(r"\bsecurity\s+engineer\b", re.I),
-    re.compile(r"\bsoftware\s+engineer\s+in\s+test\b", re.I),
-    # language-named developer/engineer roles, independent of company -- a
-    # real miss found in the audit ("Principal Java Developer - Distributed
-    # Systems, Serverless" at Elasticsearch didn't contain the word
-    # "software" at all).
-    re.compile(r"\b(java|python|golang|go|c\+\+|c#|ruby|scala|kotlin|rust|node(\.js)?)\s+(developer|engineer)\b", re.I),
 ]
 
-# Still needed even with an allowlist: a few title families would otherwise
-# match an allow pattern above for the wrong reason -- "Forward Deployed
-# [Software] Engineer" and "Solutions Engineer" both legitimately contain
-# "engineer" next to real tech words, but are customer-facing/pre-sales
-# roles, not the hands-on-building target; "ML Annotation QA Engineer"
-# matched an earlier looser pattern but is data-labeling QA, not software;
-# "Partner Applied AI Engineer"/"IT Service Engineer" are partner-facing and
-# internal-corporate-IT roles respectively, confirmed by reading real
-# postings (see the long comment above _ENG_TITLE_ALLOW).
-NON_ENGINEERING_TITLE_WORDS = {
-    "intern", "internship", "co-op",
-    "solutions architect", "solution architect", "solutions engineer", "solution engineer",
-    "sales engineer", "support engineer", "support developer",
-    "forward deployed", "field engineer", "field engineering",
-    "annotation", "qa engineer", "quality engineer", "data scientist",
-    "applied ai",
-    "partner engineer", "partner platform engineer",
-    "it service engineer", "it systems engineer", "it software architect",
-    "it support engineer",
-}
-# Word-boundary regex, not a plain substring check -- found live: "intern"
-# as a bare substring was also matching "Internal", "Internals", and
-# "International" (18 real engineering postings wrongly excluded this way,
-# e.g. "Senior Software Engineer, Fullstack (International)" and "Software
-# Engineer - Database Engine Internals"), and "quality engineer" was
-# matching inside "Quality Engineering" used as a department name after a
-# comma, not the actual title. \b on both ends of the whole phrase fixes
-# both classes at once -- "engineer" directly followed by "ing" has no
-# boundary between them, so it stops matching there too.
-_NON_ENG_RE = re.compile(
-    r"\b(?:" + "|".join(re.escape(w) for w in sorted(NON_ENGINEERING_TITLE_WORDS, key=len, reverse=True)) + r")\b",
-    re.I)
+# Phrases that match above but aren't the role: internships, and the
+# customer-facing "forward deployed" / "applied AI" families.
+_EXCLUDED_TITLE_RE = re.compile(r"\b(?:intern|internship|co-op|forward\s+deployed|applied\s+ai)\b", re.I)
 
 
-def is_likely_engineering_title(title):
-    if _NON_ENG_RE.search(title):
+def is_target_title(title):
+    if _EXCLUDED_TITLE_RE.search(title):
         return False
-    return any(p.search(title) for p in _ENG_TITLE_ALLOW)
+    return any(p.search(title) for p in _TARGET_TITLE_PATTERNS)
 
 
 def title_seniority_tier(title):
@@ -127,31 +50,24 @@ def title_seniority_tier(title):
     return "mid"
 
 
-# India/Bangalore/Bengaluru is the only target, not a toggle -- fetch_ats.py
-# already enforces this at fetch time (a non-India posting is never saved),
-# this is the same check applied again at read time. \b word-boundary match
-# -- a plain substring check matched "Indiana" on "india", a real false
-# positive found in the fetched data. Moved here (was in platform/server.py)
-# so db.py can register it as a SQL function -- same reasoning as
-# title_seniority_tier/is_likely_engineering_title living here: it's job-row
-# classification logic, not web-server logic, and SQL-level filtering needs
-# to call it per-row without a circular import back into the server module.
-_INDIA_WORDS = ("india", "bangalore", "bengaluru")
-_INDIA_RE = re.compile(r"\b(" + "|".join(_INDIA_WORDS) + r")\b")
+# Where we look: Bengaluru / Bangalore, or anything marked Remote. \b word
+# boundaries, so "Remotely" or a place that merely contains one of these words
+# doesn't match. A posting with no location at all is judged on the first 500
+# characters of its description instead.
+_LOCATION_WORDS = ("remote", "bengaluru", "bangalore")
+_LOCATION_RE = re.compile(r"\b(" + "|".join(_LOCATION_WORDS) + r")\b", re.I)
 
 
-def is_target_location(location, description_raw):
-    loc = (location or "").lower()
-    if loc:
-        return bool(_INDIA_RE.search(loc))
-    return bool(_INDIA_RE.search((description_raw or "")[:500].lower()))
+def is_target_location(location, description_raw=""):
+    text = (location or "").strip() or (description_raw or "")[:500]
+    return bool(_LOCATION_RE.search(text))
 
 
-def is_eligible(title, location, description_raw):
-    """A posting worth generating a resume for: engineering title, not a
-    manager-tier role, in the target location. Applied when analysis rows
-    are created, so ineligible postings never enter the queue."""
-    return (is_likely_engineering_title(title) and title_seniority_tier(title) != "manager"
+def is_wanted(title, location, description_raw=""):
+    """The one check a posting must pass to be stored at all, run at fetch
+    time: a target title, not a manager-tier role, in a wanted
+    location. (Age is the other fetch-time check; see fetch_ats.py.)"""
+    return (is_target_title(title) and title_seniority_tier(title) != "manager"
             and is_target_location(location, description_raw))
 
 

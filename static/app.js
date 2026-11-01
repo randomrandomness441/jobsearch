@@ -491,14 +491,14 @@ function reloadCurrentView() {
 // Fetch only. Runs in the background (a real fetch across every board takes a
 // minute or more), so start it, then poll the worker's status until it ends.
 function openFetchResult(f) {
-  const bits = [];
+  const bits = [`${f.skipped_location} wrong location`, `${f.skipped_title} wrong title`, `${f.skipped_age} too old`];
   if (f.errors) bits.push(`${f.errors} source(s) errored`);
   document.getElementById('fr-body').innerHTML = `
     <div class="score-block" style="border:1px solid ${f.ok === false ? 'var(--bad)' : 'var(--accent)'}">
       <div><div class="num">${f.new}</div><div class="dim" style="font-size:13px">new just now</div></div>
       <div style="flex:1">
         ${f.ok === false ? `<div style="font-size:14px;color:var(--bad)">Fetch failed: ${esc(f.error)}</div>`
-          : `<div style="font-size:14px">${f.seen} postings seen, ${f.rows_created} queued for generation${bits.length ? ' · ' + esc(bits.join(', ')) : ''}.</div>`}
+          : `<div style="font-size:14px">${f.seen} already tracked, ${f.rows_created} queued for generation · skipped: ${esc(bits.join(', '))}.</div>`}
       </div>
     </div>`;
   document.getElementById('overlay').hidden = false;
