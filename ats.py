@@ -71,7 +71,7 @@ def is_wanted(title, location, description_raw=""):
             and is_target_location(location, description_raw))
 
 
-# Real, specific resume-bullet rubric Sourav gave: "every bullet needs to be
+# Real, specific resume-bullet rubric the owner gave: "every bullet needs to be
 # a keyword and/or a brag... if it doesn't have a keyword and/or a brag, it
 # shouldn't exist." Keyword = a term from the JD's own qualifications/must-
 # haves. Brag = a quantified claim, OR -- when there's no hard number -- an
